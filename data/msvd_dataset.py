@@ -1,96 +1,123 @@
-import os
-import cv2
-import torch
-import numpy as np
-import pandas as pd
-from torch.utils.data import Dataset
-from ..config import NUM_SAMPLES
+import json
+from pathlib import Path
+from typing import Dict, Iterable, List
 
-class MSVDVideoCaptionDataset(Dataset):
-    def __init__(self, video_dir, csv_path, txt_path, tokenizer, max_len=20, limit=NUM_SAMPLES, frames=8):
-        self.video_dir = video_dir
+import cv2
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+from config import CFG
+
+
+class VideoCaptionDataset(Dataset):
+    """Video-caption dataset backed by real video files listed in manifest JSON."""
+
+    def __init__(
+        self,
+        samples: List[Dict],
+        tokenizer,
+        dataset_root: Path,
+        num_frames: int = 16,
+        max_len: int = 20,
+        frame_size: int = 224,
+    ):
+        self.samples = samples
         self.tokenizer = tokenizer
+        self.dataset_root = dataset_root
+        self.num_frames = num_frames
         self.max_len = max_len
-        self.frames = frames
-        
-        # Load metadata
-        print(f"Loading metadata from {csv_path}...")
-        self.data = pd.read_csv(csv_path)
-        self.data = self.data[self.data["Language"] == "English"].head(limit)
-        
-        # Load captions
-        print(f"Loading captions from {txt_path}...")
-        with open(txt_path, "r", encoding='utf-8') as f:
-            self.captions = [line.strip() for line in f if line.strip()]
-        
-        print(f"✓ Loaded {len(self.data)} English video samples.")
-        print(f"✓ Loaded {len(self.captions)} captions.")
-        
-        # Build vocabulary if tokenizer needs it
-        if hasattr(tokenizer, 'build_vocab') and not tokenizer.vocab_built:
-            tokenizer.build_vocab(self.captions)
-    
+        self.frame_size = frame_size
+
     def __len__(self):
-        return len(self.data)
-    
-    def _load_video(self, path):
-        """Load and preprocess video frames"""
-        if not os.path.exists(path):
-            return torch.zeros(self.frames, 3, 224, 224)
-        
-        cap = cv2.VideoCapture(path)
-        frames = []
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        if total == 0:
+        return len(self.samples)
+
+    def _resolve_video_path(self, item: Dict) -> Path:
+        video_path = item.get("video_path")
+        if not video_path:
+            raise KeyError(f"Missing 'video_path' in manifest row for video_id={item.get('video_id')}")
+        p = Path(video_path)
+        return p if p.is_absolute() else (self.dataset_root / p)
+
+    def _decode_frames(self, video_path: Path) -> torch.Tensor:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {video_path}")
+
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count <= 0:
             cap.release()
-            return torch.zeros(self.frames, 3, 224, 224)
-        
-        # Sample frames uniformly
-        idxs = np.linspace(0, total - 1, self.frames, dtype=int)
-        
-        for i in idxs:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Preprocess frame
+            raise RuntimeError(f"Video has no readable frames: {video_path}")
+
+        target_idx = np.linspace(0, frame_count - 1, num=self.num_frames, dtype=np.int64)
+        frames = []
+        last_frame = None
+        for idx in target_idx:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                if last_frame is None:
+                    continue
+                frame = last_frame
+            else:
+                last_frame = frame
+
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (224, 224))
-            frame = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+            frame = cv2.resize(frame, (self.frame_size, self.frame_size), interpolation=cv2.INTER_AREA)
             frames.append(frame)
-        
+
         cap.release()
-        
-        # Padding if not enough frames
-        while len(frames) < self.frames:
-            frames.append(torch.zeros(3, 224, 224))
-        
-        return torch.stack(frames)
-    
+        if not frames:
+            raise RuntimeError(f"Unable to decode sampled frames from video: {video_path}")
+
+        while len(frames) < self.num_frames:
+            frames.append(frames[-1])
+
+        arr = np.stack(frames, axis=0).astype(np.float32) / 255.0  # [T,H,W,C]
+        return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
+
     def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        vid_name = f"{row['VideoID']}_{int(row['Start'])}_{int(row['End'])}.avi"
-        vid_path = os.path.join(self.video_dir, vid_name)
-        
-        # Load video frames
-        video = self._load_video(vid_path)
-        
-        # Get corresponding caption
-        caption = self.captions[idx % len(self.captions)]
-        
-        # Tokenize caption
-        tokens = self.tokenizer(
-            caption,
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_len
-        )
-        
+        item = self.samples[idx]
+        tokenized = self.tokenizer(item["caption"], max_length=self.max_len)
+        video = self._decode_frames(self._resolve_video_path(item))
         return {
-            "video": video,  # Shape: (num_frames, 3, 224, 224)
-            "input_ids": tokens['input_ids'].squeeze(0),  # Shape: (max_len,)
-            "attention_mask": tokens['attention_mask'].squeeze(0),  # Shape: (max_len,)
-            "caption": caption  # Original caption text
+            "video": video,
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+            "caption": item["caption"],
+            "video_id": item["video_id"],
         }
+
+
+def _slice_fraction(items: List[Dict]):
+    if CFG.data_fraction >= 1.0:
+        return items
+    k = max(1, int(len(items) * CFG.data_fraction))
+    return items[:k]
+
+
+def load_manifest(path: Path) -> List[Dict]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing manifest: {path}")
+    return json.loads(path.read_text())
+
+
+def collect_captions(dataset_names: Iterable[str], split: str = "train") -> List[str]:
+    captions: List[str] = []
+    for name in dataset_names:
+        path = Path(CFG.data_root) / name / f"{split}.json"
+        for row in load_manifest(path):
+            caption = str(row.get("caption", "")).strip()
+            if caption:
+                captions.append(caption)
+    return captions
+
+
+def build_dataset(dataset_name: str, split: str, tokenizer):
+    dataset_root = Path(CFG.data_root) / dataset_name
+    manifest_path = dataset_root / f"{split}.json"
+    samples = load_manifest(manifest_path)
+    samples = _slice_fraction(samples)
+    if not samples:
+        raise ValueError(f"Empty split after applying data_fraction: {manifest_path}")
+    return VideoCaptionDataset(samples, tokenizer, dataset_root=dataset_root, num_frames=CFG.num_frames, max_len=CFG.max_len)
