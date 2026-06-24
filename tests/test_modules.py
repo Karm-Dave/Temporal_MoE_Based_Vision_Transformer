@@ -9,6 +9,7 @@ from models import (
     TemporalFusion,
 )
 from train import (
+    AntiUAVExtractedFrameDataset,
     DRISHTICollator,
     SyntheticAntiUAVDataset,
     configure_drishti_training_stage,
@@ -182,6 +183,46 @@ def test_drishti_collator_preserves_frame_targets():
     assert len(batch["frame_targets"]) == 2
     assert len(batch["frame_targets"][0]) == 5
     assert batch["frame_targets"][0][0]["boxes"].shape == (1, 4)
+
+
+def test_extracted_frame_dataset_reads_image_sequence(tmp_path):
+    import cv2
+    import numpy as np
+    import json
+
+    sequence_dir = tmp_path / "train" / "seq001"
+    frame_dir = sequence_dir / "visible"
+    frame_dir.mkdir(parents=True)
+    for index in range(6):
+        frame = np.zeros((24, 32, 3), dtype=np.uint8)
+        frame[:, :, 1] = 20 + index
+        cv2.imwrite(str(frame_dir / f"{index:06d}.jpg"), frame)
+    (sequence_dir / "visible.json").write_text(
+        json.dumps(
+            {
+                "gt_rect": [[4, 5, 8, 6] for _ in range(6)],
+                "exist": [1 for _ in range(6)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = AntiUAVExtractedFrameDataset(
+        frames_root=tmp_path,
+        split="train",
+        modality="visible",
+        num_frames=5,
+        height=16,
+        width=16,
+        clip_stride=2,
+        image_channels=3,
+    )
+    item = dataset[0]
+
+    assert item["frames"].shape == (5, 3, 16, 16)
+    assert len(item["frame_targets"]) == 5
+    assert item["frame_targets"][0]["boxes"].shape == (1, 4)
+    assert item["image_ids"][0] == "seq001:0"
 
 
 def test_one_optimization_step_updates_trainable_core():

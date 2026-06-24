@@ -3,6 +3,7 @@
 from .antiuav import (
     AntiUAVDatasetPaths,
     AntiUAVDetectionCollator,
+    AntiUAVExtractedFrameDataset,
     AntiUAVRGBTVideoDataset,
     DRISHTICollator,
     MODELSCOPE_ANTI_UAV_URL,
@@ -27,6 +28,7 @@ from .drishti_loss import (
 __all__ = [
     "AntiUAVDatasetPaths",
     "AntiUAVDetectionCollator",
+    "AntiUAVExtractedFrameDataset",
     "AntiUAVRGBTVideoDataset",
     "DRISHTICollator",
     "DRISHTILossWeights",

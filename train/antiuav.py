@@ -41,6 +41,22 @@ class AntiUAVVideoSequence:
         return max(len(self.boxes), len(self.exists))
 
 
+@dataclass(frozen=True)
+class AntiUAVFrameSequence:
+    """One pre-extracted Anti-UAV sequence with frame files and labels."""
+
+    name: str
+    frame_dir: Path
+    ann_path: Path
+    frame_paths: tuple[Path, ...]
+    boxes: tuple[Any, ...]
+    exists: tuple[bool, ...]
+
+    @property
+    def num_frames(self) -> int:
+        return min(len(self.frame_paths), max(len(self.boxes), len(self.exists)))
+
+
 def _resize_chw(image: Tensor, height: int, width: int) -> Tensor:
     if image.ndim != 3:
         raise ValueError("image tensor must have shape [channels, height, width]")
@@ -126,6 +142,71 @@ def _read_antiuav_json(path: Path) -> tuple[tuple[Any, ...], tuple[bool, ...]]:
         exists = [_bool_from_annotation(value) for value in raw_exists]
         exists.extend(_box_has_area(boxes[idx]) for idx in range(len(exists), frame_count))
     return tuple(boxes), tuple(exists)
+
+
+def _cv_frame_to_tensor(frame: Any, image_channels: int) -> Tensor:
+    if frame.ndim == 2:
+        tensor = torch.from_numpy(frame.copy()).float().div(255.0).unsqueeze(0)
+        return tensor.repeat(3, 1, 1) if image_channels == 3 else tensor
+    if image_channels == 1:
+        try:
+            import cv2
+        except ImportError as exc:  # pragma: no cover - depends on optional env
+            raise ImportError("Install opencv-python-headless to decode frames.") from exc
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return torch.from_numpy(gray.copy()).float().div(255.0).unsqueeze(0)
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - depends on optional env
+        raise ImportError("Install opencv-python-headless to decode frames.") from exc
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(rgb.copy()).float().div(255.0).permute(2, 0, 1)
+
+
+def _target_from_antiuav_box(
+    raw_box: Any,
+    exists: bool,
+    image_size: tuple[int, int],
+    box_format: str,
+) -> dict[str, Tensor]:
+    if not exists:
+        return _empty_target()
+
+    image_width, image_height = image_size
+    boxes = []
+    for candidate in _candidate_boxes(raw_box):
+        try:
+            values = [float(value) for value in candidate[:4]]
+        except (TypeError, ValueError):
+            continue
+        if len(values) < 4:
+            continue
+        if box_format == "xyxy":
+            x1, y1, x2, y2 = values
+            x, y, box_w, box_h = x1, y1, x2 - x1, y2 - y1
+        else:
+            x, y, box_w, box_h = values
+        if box_w <= 0 or box_h <= 0:
+            continue
+        cx = (x + box_w / 2.0) / max(image_width, 1)
+        cy = (y + box_h / 2.0) / max(image_height, 1)
+        boxes.append(
+            [
+                min(max(cx, 0.0), 1.0),
+                min(max(cy, 0.0), 1.0),
+                min(max(box_w / max(image_width, 1), 0.0), 1.0),
+                min(max(box_h / max(image_height, 1), 0.0), 1.0),
+            ]
+        )
+
+    if not boxes:
+        return _empty_target()
+    return {
+        "boxes": torch.tensor(boxes, dtype=torch.float32),
+        "labels": torch.ones(len(boxes), dtype=torch.long),
+    }
 
 
 class AntiUAVRGBTVideoDataset(Dataset):
@@ -275,11 +356,7 @@ class AntiUAVRGBTVideoDataset(Dataset):
                     continue
                 previous_frame = frame
                 source_height, source_width = frame.shape[:2]
-                if frame.ndim == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                tensor = torch.from_numpy(frame.copy()).float().div(255.0).unsqueeze(0)
-                if self.image_channels == 3:
-                    tensor = tensor.repeat(3, 1, 1)
+                tensor = _cv_frame_to_tensor(frame, self.image_channels)
                 frames.append(_resize_chw(tensor, self.height, self.width))
         finally:
             cap.release()
@@ -291,42 +368,7 @@ class AntiUAVRGBTVideoDataset(Dataset):
         exists: bool,
         image_size: tuple[int, int],
     ) -> dict[str, Tensor]:
-        if not exists:
-            return _empty_target()
-
-        image_width, image_height = image_size
-        boxes = []
-        for candidate in _candidate_boxes(raw_box):
-            try:
-                values = [float(value) for value in candidate[:4]]
-            except (TypeError, ValueError):
-                continue
-            if len(values) < 4:
-                continue
-            if self.box_format == "xyxy":
-                x1, y1, x2, y2 = values
-                x, y, box_w, box_h = x1, y1, x2 - x1, y2 - y1
-            else:
-                x, y, box_w, box_h = values
-            if box_w <= 0 or box_h <= 0:
-                continue
-            cx = (x + box_w / 2.0) / max(image_width, 1)
-            cy = (y + box_h / 2.0) / max(image_height, 1)
-            boxes.append(
-                [
-                    min(max(cx, 0.0), 1.0),
-                    min(max(cy, 0.0), 1.0),
-                    min(max(box_w / max(image_width, 1), 0.0), 1.0),
-                    min(max(box_h / max(image_height, 1), 0.0), 1.0),
-                ]
-            )
-
-        if not boxes:
-            return _empty_target()
-        return {
-            "boxes": torch.tensor(boxes, dtype=torch.float32),
-            "labels": torch.ones(len(boxes), dtype=torch.long),
-        }
+        return _target_from_antiuav_box(raw_box, exists, image_size, self.box_format)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         seq_idx, start = self.samples[index]
@@ -341,6 +383,153 @@ class AntiUAVRGBTVideoDataset(Dataset):
             )
             for frame_index in frame_indices
         ]
+        return {
+            "frames": torch.stack(frames),
+            "frame_targets": targets,
+            "image_ids": [f"{sequence.name}:{frame_index}" for frame_index in frame_indices],
+            "sequence": sequence.name,
+            "dataset_url": self.dataset_url,
+        }
+
+
+class AntiUAVExtractedFrameDataset(Dataset):
+    """Temporal windows from pre-extracted Anti-UAV frames.
+
+    Expected structure:
+
+    ``frames_root/train/<sequence>/visible/000000.jpg``
+    ``frames_root/train/<sequence>/visible.json``
+
+    The paired annotations are copied by ``python -m train.extract_frames``.
+    """
+
+    dataset_url = "local Anti-UAV extracted frames"
+    image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+    def __init__(
+        self,
+        frames_root: str | Path,
+        split: str = "train",
+        modality: str = "visible",
+        num_frames: int = 5,
+        height: int = 448,
+        width: int = 448,
+        clip_stride: int = 4,
+        frame_stride: int = 1,
+        image_channels: int = 3,
+        box_format: str = "xywh",
+        sequence_ids: set[str] | None = None,
+    ) -> None:
+        self.frames_root = Path(frames_root)
+        self.split = split
+        self.split_dir = self.frames_root / split
+        self.modality = modality
+        self.num_frames = num_frames
+        self.height = height
+        self.width = width
+        self.clip_stride = max(1, clip_stride)
+        self.frame_stride = max(1, frame_stride)
+        self.image_channels = image_channels
+        self.box_format = box_format
+
+        if self.modality not in {"infrared", "visible"}:
+            raise ValueError("modality must be 'infrared' or 'visible'")
+        if self.image_channels not in {1, 3}:
+            raise ValueError("image_channels must be 1 or 3")
+        if self.box_format not in {"xywh", "xyxy"}:
+            raise ValueError("box_format must be 'xywh' or 'xyxy'")
+        if not self.split_dir.exists():
+            raise FileNotFoundError(f"Extracted frame split directory not found: {self.split_dir}")
+
+        self.sequences = self._discover_sequences(sequence_ids)
+        if not self.sequences:
+            raise FileNotFoundError(
+                f"No extracted {self.modality} frames + annotations found under {self.split_dir}."
+            )
+
+        self.samples: list[tuple[int, int]] = []
+        window_span = (self.num_frames - 1) * self.frame_stride + 1
+        for seq_idx, sequence in enumerate(self.sequences):
+            max_start = max(0, sequence.num_frames - window_span)
+            starts = list(range(0, max_start + 1, self.clip_stride)) or [0]
+            if starts[-1] != max_start:
+                starts.append(max_start)
+            self.samples.extend((seq_idx, start) for start in starts)
+
+    def _discover_sequences(self, sequence_ids: set[str] | None) -> list[AntiUAVFrameSequence]:
+        sequences: list[AntiUAVFrameSequence] = []
+        for sequence_dir in sorted(path for path in self.split_dir.iterdir() if path.is_dir()):
+            if sequence_ids is not None and sequence_dir.name not in sequence_ids:
+                continue
+            frame_dir = sequence_dir / self.modality
+            ann_path = sequence_dir / f"{self.modality}.json"
+            if not frame_dir.exists() or not ann_path.exists():
+                continue
+            frame_paths = tuple(
+                sorted(
+                    path
+                    for path in frame_dir.iterdir()
+                    if path.suffix.lower() in self.image_extensions
+                )
+            )
+            if not frame_paths:
+                continue
+            boxes, exists = _read_antiuav_json(ann_path)
+            if not boxes:
+                continue
+            sequences.append(
+                AntiUAVFrameSequence(
+                    name=sequence_dir.name,
+                    frame_dir=frame_dir,
+                    ann_path=ann_path,
+                    frame_paths=frame_paths,
+                    boxes=boxes,
+                    exists=exists,
+                )
+            )
+        return sequences
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _frame_indices(self, start: int, sequence: AntiUAVFrameSequence) -> list[int]:
+        last = max(sequence.num_frames - 1, 0)
+        return [
+            min(start + frame_idx * self.frame_stride, last)
+            for frame_idx in range(self.num_frames)
+        ]
+
+    def _read_frame(self, path: Path) -> tuple[Tensor, tuple[int, int]]:
+        try:
+            import cv2
+        except ImportError as exc:  # pragma: no cover - depends on optional env
+            raise ImportError("Install opencv-python-headless to read extracted frames.") from exc
+
+        frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if frame is None:
+            return torch.zeros(self.image_channels, self.height, self.width), (self.width, self.height)
+        source_height, source_width = frame.shape[:2]
+        tensor = _cv_frame_to_tensor(frame, self.image_channels)
+        return _resize_chw(tensor, self.height, self.width), (source_width, source_height)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        seq_idx, start = self.samples[index]
+        sequence = self.sequences[seq_idx]
+        frame_indices = self._frame_indices(start, sequence)
+        frames = []
+        image_size = (self.width, self.height)
+        targets = []
+        for frame_index in frame_indices:
+            frame, image_size = self._read_frame(sequence.frame_paths[frame_index])
+            frames.append(frame)
+            targets.append(
+                _target_from_antiuav_box(
+                    sequence.boxes[frame_index],
+                    sequence.exists[frame_index] if frame_index < len(sequence.exists) else False,
+                    image_size,
+                    self.box_format,
+                )
+            )
         return {
             "frames": torch.stack(frames),
             "frame_targets": targets,

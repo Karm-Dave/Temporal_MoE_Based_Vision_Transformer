@@ -18,6 +18,7 @@ from tqdm import tqdm
 from models import DRISHTIConfig, DRISHTIPipeline
 from train import (
     AntiUAVDatasetPaths,
+    AntiUAVExtractedFrameDataset,
     AntiUAVRGBTVideoDataset,
     DRISHTICollator,
     DRISHTILossWeights,
@@ -38,6 +39,7 @@ class ExperimentConfig:
     smoke: bool = True
     dataset_url: str = MODELSCOPE_ANTI_UAV_URL
     data_root: str | None = None
+    frames_root: str | None = None
     train_split: str = "train"
     val_split: str = "test"
     modality: str = "visible"
@@ -117,7 +119,33 @@ def _paths(config: ExperimentConfig) -> tuple[AntiUAVDatasetPaths, AntiUAVDatase
 def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, dict[str, Any]]:
     train_paths, val_paths = _paths(config)
     collator = DRISHTICollator()
-    if config.data_root:
+    if config.frames_root:
+        train_dataset = AntiUAVExtractedFrameDataset(
+            frames_root=config.frames_root,
+            split=config.train_split,
+            modality=config.modality,
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+            clip_stride=config.clip_stride,
+            frame_stride=config.frame_stride,
+            image_channels=config.image_channels,
+            box_format=config.box_format,
+        )
+        val_dataset = AntiUAVExtractedFrameDataset(
+            frames_root=config.frames_root,
+            split=config.val_split,
+            modality=config.modality,
+            num_frames=config.num_frames,
+            height=config.frame_height,
+            width=config.frame_width,
+            clip_stride=config.clip_stride,
+            frame_stride=config.frame_stride,
+            image_channels=config.image_channels,
+            box_format=config.box_format,
+        )
+        source = f"antiuav_extracted_{config.modality}_frames"
+    elif config.data_root:
         train_dataset = AntiUAVRGBTVideoDataset(
             data_root=config.data_root,
             split=config.train_split,
@@ -177,7 +205,8 @@ def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, 
         source = "synthetic_smoke"
     else:
         raise ValueError(
-            "Full DRISHTI training requires --data-root for Anti-UAV-RGBT or "
+            "Full DRISHTI training requires --frames-root for extracted frames, "
+            "--data-root for Anti-UAV-RGBT videos, or "
             "--train-image-root/--train-ann-file/--val-image-root/--val-ann-file "
             f"for COCO-format data from {config.dataset_url}."
         )
@@ -188,6 +217,8 @@ def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, 
         shuffle=True,
         collate_fn=collator,
         num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=config.num_workers > 0,
         drop_last=False,
     )
     val_loader = DataLoader(
@@ -196,6 +227,8 @@ def make_dataloaders(config: ExperimentConfig) -> tuple[DataLoader, DataLoader, 
         shuffle=False,
         collate_fn=collator,
         num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=config.num_workers > 0,
         drop_last=False,
     )
     sizes = {
@@ -371,6 +404,7 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(smoke=DEFAULT_CONFIG.smoke)
     parser.add_argument("--dataset-url", default=DEFAULT_CONFIG.dataset_url)
     parser.add_argument("--data-root", default=DEFAULT_CONFIG.data_root)
+    parser.add_argument("--frames-root", default=DEFAULT_CONFIG.frames_root)
     parser.add_argument("--train-split", default=DEFAULT_CONFIG.train_split)
     parser.add_argument("--val-split", default=DEFAULT_CONFIG.val_split)
     parser.add_argument("--modality", choices=["infrared", "visible"], default=DEFAULT_CONFIG.modality)
@@ -383,6 +417,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG.batch_size)
+    parser.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG.num_workers)
     parser.add_argument("--num-frames", type=int, default=DEFAULT_CONFIG.num_frames)
     parser.add_argument("--clip-stride", type=int, default=DEFAULT_CONFIG.clip_stride)
     parser.add_argument("--frame-stride", type=int, default=DEFAULT_CONFIG.frame_stride)
@@ -410,6 +445,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         smoke=args.smoke,
         dataset_url=args.dataset_url,
         data_root=args.data_root,
+        frames_root=args.frames_root,
         train_split=args.train_split,
         val_split=args.val_split,
         modality=args.modality,
@@ -420,6 +456,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         results_dir=args.results_dir,
         stage=args.stage,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         num_frames=args.num_frames,
         clip_stride=args.clip_stride,
         frame_stride=args.frame_stride,
@@ -452,7 +489,7 @@ def main() -> None:
         "Running DRISHTI-CORE Anti-UAV detector "
         f"mode={'smoke' if config.smoke else 'full'} "
         f"stage={config.stage} epochs={config.epochs} "
-        f"source={config.data_root or config.dataset_url}"
+        f"source={config.frames_root or config.data_root or config.dataset_url}"
     )
 
     train_loader, val_loader, sizes = make_dataloaders(config)

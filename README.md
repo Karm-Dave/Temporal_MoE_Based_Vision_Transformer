@@ -77,6 +77,54 @@ python experiment.py --smoke --epochs 1 --device cpu
 The smoke experiment uses synthetic Anti-UAV-style moving boxes so the pipeline
 can be verified without downloading data.
 
+## Faster Full Training
+
+Raw `.mp4` training is slow because each batch must seek and decode video
+frames. For full training, extract frames once and train from image files:
+
+```bash
+python -m train.extract_frames \
+  --data-root "/home/newuser1/dataset" \
+  --output-root "/home/newuser1/dataset_frames" \
+  --splits train val test \
+  --modalities visible \
+  --workers 4
+```
+
+This writes:
+
+```text
+/home/newuser1/dataset_frames/
+  train/<video_id>/visible/000000.jpg
+  train/<video_id>/visible.json
+  val/<video_id>/visible/000000.jpg
+  val/<video_id>/visible.json
+```
+
+Then train with `--frames-root`:
+
+```bash
+python experiment.py \
+  --full \
+  --frames-root "/home/newuser1/dataset_frames" \
+  --train-split train \
+  --val-split val \
+  --modality visible \
+  --stage detector \
+  --epochs 80 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --height 448 \
+  --width 448 \
+  --image-channels 3 \
+  --crop-size 64 \
+  --num-crops 8 \
+  --feature-dim 256 \
+  --clip-stride 16 \
+  --device cuda \
+  --results-dir results_detector
+```
+
 ## Anti-UAV Data
 
 For extracted Anti-UAV-RGBT videos:
