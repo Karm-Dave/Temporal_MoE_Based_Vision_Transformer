@@ -121,6 +121,43 @@ python experiment.py \
   --num-crops 8 \
   --feature-dim 256 \
   --clip-stride 16 \
+  --checkpoint-interval 10 \
+  --device cuda \
+  --results-dir results_detector
+```
+
+During training, checkpoints are written to:
+
+```text
+results_detector/checkpoints/latest.pt
+results_detector/checkpoints/epoch_010.pt
+results_detector/checkpoints/epoch_020.pt
+...
+results_detector/checkpoints/detector_best.pt
+```
+
+If training is interrupted, resume the same stage from `latest.pt`:
+
+```bash
+python experiment.py \
+  --full \
+  --frames-root "/home/newuser1/dataset_frames" \
+  --train-split train \
+  --val-split val \
+  --modality visible \
+  --stage detector \
+  --resume-checkpoint results_detector/checkpoints/latest.pt \
+  --epochs 80 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --height 448 \
+  --width 448 \
+  --image-channels 3 \
+  --crop-size 64 \
+  --num-crops 8 \
+  --feature-dim 256 \
+  --clip-stride 16 \
+  --checkpoint-interval 10 \
   --device cuda \
   --results-dir results_detector
 ```

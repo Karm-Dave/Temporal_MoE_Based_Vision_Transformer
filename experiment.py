@@ -76,6 +76,7 @@ class ExperimentConfig:
     moe_top_k: int = 2
     moe_ffn_dim: int = 128
     eval_batches: int = 10
+    checkpoint_interval: int = 10
 
     @property
     def epochs(self) -> int:
@@ -297,10 +298,11 @@ def train_model(
     device: torch.device,
     optimizer: torch.optim.Optimizer,
     results_dir: Path,
+    start_epoch: int = 0,
 ) -> list[dict[str, float]]:
     weights = DRISHTILossWeights()
     history: list[dict[str, float]] = []
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         model.train()
         progress = tqdm(loader, desc=f"epoch {epoch + 1}/{config.epochs}")
         for step, batch in enumerate(progress, start=1):
@@ -322,13 +324,27 @@ def train_model(
             history.append(row)
             progress.set_postfix(loss=f"{float(loss.detach().cpu()):.3f}")
 
+        should_save_numbered = (
+            config.checkpoint_interval > 0
+            and (epoch + 1) % config.checkpoint_interval == 0
+        )
+        if should_save_numbered:
+            save_checkpoint(
+                model,
+                results_dir,
+                optimizer=optimizer,
+                config=config,
+                epoch=epoch + 1,
+                name=f"epoch_{epoch + 1:03d}.pt",
+            )
         save_checkpoint(
             model,
             results_dir,
             optimizer=optimizer,
             config=config,
             epoch=epoch + 1,
-            name=f"epoch_{epoch + 1:03d}.pt",
+            name="latest.pt",
+            update_latest=False,
         )
     return history
 
@@ -369,6 +385,7 @@ def save_checkpoint(
     config: ExperimentConfig,
     epoch: int | None,
     name: str,
+    update_latest: bool = True,
 ) -> Path:
     checkpoint_dir = results_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -381,19 +398,33 @@ def save_checkpoint(
     }
     path = checkpoint_dir / name
     torch.save(checkpoint, path)
-    torch.save(checkpoint, checkpoint_dir / "latest.pt")
+    if update_latest and name != "latest.pt":
+        torch.save(checkpoint, checkpoint_dir / "latest.pt")
     return path
 
 
 def load_checkpoint_if_requested(
     model: DRISHTIPipeline,
+    optimizer: torch.optim.Optimizer | None,
     checkpoint_path: str | None,
     device: torch.device,
+    current_stage: str,
 ) -> dict[str, Any] | None:
     if checkpoint_path is None:
         return None
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+    checkpoint_stage = (checkpoint.get("experiment_config") or {}).get("stage")
+    optimizer_state = checkpoint.get("optimizer_state_dict") if isinstance(checkpoint, dict) else None
+    if (
+        optimizer is not None
+        and optimizer_state is not None
+        and checkpoint_stage == current_stage
+    ):
+        try:
+            optimizer.load_state_dict(optimizer_state)
+        except ValueError:
+            print("Optimizer state did not match current stage; loaded model weights only.")
     return checkpoint
 
 
@@ -416,6 +447,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", choices=["detector", "temporal", "moe", "all"], default=DEFAULT_CONFIG.stage)
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--checkpoint-interval", type=int, default=DEFAULT_CONFIG.checkpoint_interval)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG.batch_size)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_CONFIG.num_workers)
     parser.add_argument("--num-frames", type=int, default=DEFAULT_CONFIG.num_frames)
@@ -468,6 +500,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         num_crops=args.num_crops,
         feature_dim=args.feature_dim,
         moe_num_experts=args.moe_num_experts,
+        checkpoint_interval=args.checkpoint_interval,
     )
     if args.epochs is not None:
         if config.smoke:
@@ -494,11 +527,34 @@ def main() -> None:
 
     train_loader, val_loader, sizes = make_dataloaders(config)
     model = DRISHTIPipeline(build_model_config(config)).to(device)
-    load_checkpoint_if_requested(model, args.resume_checkpoint, device)
     configure_drishti_training_stage(model, config.stage)
     optimizer = build_optimizer(model, config)
+    checkpoint = load_checkpoint_if_requested(
+        model,
+        optimizer,
+        args.resume_checkpoint,
+        device,
+        current_stage=config.stage,
+    )
+    checkpoint_stage = ((checkpoint or {}).get("experiment_config") or {}).get("stage")
+    start_epoch = int((checkpoint or {}).get("epoch") or 0) if checkpoint_stage == config.stage else 0
+    if start_epoch >= config.epochs:
+        print(
+            f"Checkpoint already at epoch {start_epoch}; "
+            f"requested epochs={config.epochs}. Nothing to train."
+        )
+        history = []
+    else:
+        history = train_model(
+            model,
+            train_loader,
+            config,
+            device,
+            optimizer,
+            results_dir,
+            start_epoch=start_epoch,
+        )
 
-    history = train_model(model, train_loader, config, device, optimizer, results_dir)
     eval_summary = evaluate_model(model, val_loader, config, device)
     write_history_csv(history, results_dir / "train_history.csv")
     (results_dir / "config.json").write_text(
