@@ -1,0 +1,10 @@
+torch
+torchvision
+pycocotools
+opencv-python-headless
+matplotlib
+numpy
+tqdm
+
+[dev]
+pytest

@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: temporal-moe-vit
+Version: 0.1.0
+Summary: DRISHTI-CORE sparse temporal MoE detector for Anti-UAV data.
+Requires-Python: >=3.10
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: pycocotools
+Requires-Dist: opencv-python-headless
+Requires-Dist: matplotlib
+Requires-Dist: numpy
+Requires-Dist: tqdm
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"

@@ -1,16 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "temporal-moe-vit"
 version = "0.1.0"
-description = "Research scaffold for sparse motion-conditioned Anti-UAV detection."
+description = "DRISHTI-CORE sparse temporal MoE detector for Anti-UAV data."
 requires-python = ">=3.10"
 dependencies = [
     "torch",
     "torchvision",
     "pycocotools",
+    "opencv-python-headless",
     "matplotlib",
     "numpy",
     "tqdm",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+include = ["models*", "train*"]
+exclude = ["tests*", "results*", "results_*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
