@@ -77,6 +77,7 @@ class ExperimentConfig:
     moe_ffn_dim: int = 128
     eval_batches: int = 10
     checkpoint_interval: int = 10
+    eval_only: bool = False
 
     @property
     def epochs(self) -> int:
@@ -291,6 +292,129 @@ def output_diagnostics(output: Any) -> dict[str, float]:
     }
 
 
+def cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    """Convert normalized center boxes to corner boxes."""
+
+    centers = boxes[..., :2]
+    half_sizes = boxes[..., 2:].clamp(min=0.0) / 2.0
+    top_left = centers - half_sizes
+    bottom_right = centers + half_sizes
+    return torch.cat([top_left, bottom_right], dim=-1).clamp(0.0, 1.0)
+
+
+def box_iou_matrix(boxes_a: torch.Tensor, boxes_b: torch.Tensor) -> torch.Tensor:
+    if boxes_a.numel() == 0 or boxes_b.numel() == 0:
+        return boxes_a.new_zeros((boxes_a.shape[0], boxes_b.shape[0]))
+
+    top_left = torch.maximum(boxes_a[:, None, :2], boxes_b[None, :, :2])
+    bottom_right = torch.minimum(boxes_a[:, None, 2:], boxes_b[None, :, 2:])
+    intersection_size = (bottom_right - top_left).clamp(min=0.0)
+    intersection = intersection_size[..., 0] * intersection_size[..., 1]
+
+    area_a = (boxes_a[:, 2] - boxes_a[:, 0]).clamp(min=0.0) * (
+        boxes_a[:, 3] - boxes_a[:, 1]
+    ).clamp(min=0.0)
+    area_b = (boxes_b[:, 2] - boxes_b[:, 0]).clamp(min=0.0) * (
+        boxes_b[:, 3] - boxes_b[:, 1]
+    ).clamp(min=0.0)
+    union = area_a[:, None] + area_b[None, :] - intersection
+    return intersection / union.clamp(min=1e-7)
+
+
+class MeanAveragePrecision50:
+    """Dataset-level AP at IoU 0.50 for DRISHTI crop predictions."""
+
+    def __init__(self, iou_threshold: float = 0.50) -> None:
+        self.iou_threshold = iou_threshold
+        self.scores: list[float] = []
+        self.true_positives: list[float] = []
+        self.false_positives: list[float] = []
+        self.num_ground_truth = 0
+
+    @staticmethod
+    def _target_boxes(target: dict[str, torch.Tensor] | None) -> torch.Tensor:
+        if target is None:
+            return torch.zeros(0, 4, dtype=torch.float32)
+        boxes = target.get("boxes")
+        if boxes is None or boxes.numel() == 0:
+            return torch.zeros(0, 4, dtype=torch.float32)
+        return boxes.detach().cpu().float().reshape(-1, 4).clamp(0.0, 1.0)
+
+    def update(self, output: Any, frame_targets: list[list[dict[str, torch.Tensor]]]) -> None:
+        pred_boxes = output.boxes.detach().cpu().float().clamp(0.0, 1.0)
+        scores = torch.sigmoid(output.object_logits.detach().cpu().float()).squeeze(-1)
+        if scores.ndim == 1:
+            scores = scores.unsqueeze(0)
+
+        for batch_idx, sequence_targets in enumerate(frame_targets):
+            final_target = sequence_targets[-1] if sequence_targets else None
+            gt_boxes = self._target_boxes(final_target)
+            self.num_ground_truth += int(gt_boxes.shape[0])
+            matched = torch.zeros(gt_boxes.shape[0], dtype=torch.bool)
+            gt_xyxy = cxcywh_to_xyxy(gt_boxes)
+            pred_xyxy = cxcywh_to_xyxy(pred_boxes[batch_idx])
+            order = torch.argsort(scores[batch_idx], descending=True)
+
+            for pred_idx in order.tolist():
+                score = float(scores[batch_idx, pred_idx])
+                if not np.isfinite(score):
+                    continue
+                is_true_positive = False
+                if gt_xyxy.numel() > 0:
+                    ious = box_iou_matrix(pred_xyxy[pred_idx].unsqueeze(0), gt_xyxy).squeeze(0)
+                    best_iou, best_idx = torch.max(ious, dim=0)
+                    if float(best_iou) >= self.iou_threshold and not bool(matched[int(best_idx)]):
+                        matched[int(best_idx)] = True
+                        is_true_positive = True
+                self.scores.append(score)
+                self.true_positives.append(1.0 if is_true_positive else 0.0)
+                self.false_positives.append(0.0 if is_true_positive else 1.0)
+
+    def compute(self) -> dict[str, float]:
+        num_predictions = len(self.scores)
+        if self.num_ground_truth == 0 or num_predictions == 0:
+            return {
+                "map50": 0.0,
+                "precision50": 0.0,
+                "recall50": 0.0,
+                "eval_ground_truth_boxes": float(self.num_ground_truth),
+                "eval_predictions": float(num_predictions),
+            }
+
+        scores = torch.tensor(self.scores, dtype=torch.float32)
+        true_positives = torch.tensor(self.true_positives, dtype=torch.float32)
+        false_positives = torch.tensor(self.false_positives, dtype=torch.float32)
+        order = torch.argsort(scores, descending=True)
+        true_positives = true_positives[order]
+        false_positives = false_positives[order]
+
+        cumulative_tp = torch.cumsum(true_positives, dim=0)
+        cumulative_fp = torch.cumsum(false_positives, dim=0)
+        recall = cumulative_tp / max(float(self.num_ground_truth), 1.0)
+        precision = cumulative_tp / (cumulative_tp + cumulative_fp).clamp(min=1e-7)
+
+        padded_recall = torch.cat([torch.zeros(1), recall, torch.ones(1)])
+        padded_precision = torch.cat([torch.zeros(1), precision, torch.zeros(1)])
+        for idx in range(padded_precision.numel() - 1, 0, -1):
+            padded_precision[idx - 1] = torch.maximum(
+                padded_precision[idx - 1],
+                padded_precision[idx],
+            )
+        changed = torch.where(padded_recall[1:] != padded_recall[:-1])[0]
+        ap = torch.sum(
+            (padded_recall[changed + 1] - padded_recall[changed])
+            * padded_precision[changed + 1]
+        )
+
+        return {
+            "map50": float(ap),
+            "precision50": float(precision[-1]),
+            "recall50": float(recall[-1]),
+            "eval_ground_truth_boxes": float(self.num_ground_truth),
+            "eval_predictions": float(num_predictions),
+        }
+
+
 def train_model(
     model: DRISHTIPipeline,
     loader: DataLoader,
@@ -358,16 +482,19 @@ def evaluate_model(
     model.eval()
     weights = DRISHTILossWeights()
     rows: list[dict[str, float]] = []
+    map50 = MeanAveragePrecision50()
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc="evaluate"), start=1):
             if config.smoke and batch_idx > config.eval_batches:
                 break
             _, metrics, output = forward_and_loss(model, batch, config, weights, device)
             rows.append({**metrics, **output_diagnostics(output)})
+            map50.update(output, batch["frame_targets"])
     if not rows:
         return {}
-    return {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
-
+    summary = {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
+    summary.update(map50.compute())
+    return summary
 
 def write_history_csv(history: list[dict[str, float]], path: Path) -> None:
     if not history:
@@ -446,6 +573,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", default=DEFAULT_CONFIG.results_dir)
     parser.add_argument("--stage", choices=["detector", "temporal", "moe", "all"], default=DEFAULT_CONFIG.stage)
     parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=DEFAULT_CONFIG.checkpoint_interval)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG.batch_size)
@@ -501,6 +629,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         feature_dim=args.feature_dim,
         moe_num_experts=args.moe_num_experts,
         checkpoint_interval=args.checkpoint_interval,
+        eval_only=args.eval_only,
     )
     if args.epochs is not None:
         if config.smoke:
@@ -538,7 +667,12 @@ def main() -> None:
     )
     checkpoint_stage = ((checkpoint or {}).get("experiment_config") or {}).get("stage")
     start_epoch = int((checkpoint or {}).get("epoch") or 0) if checkpoint_stage == config.stage else 0
-    if start_epoch >= config.epochs:
+    if config.eval_only:
+        if args.resume_checkpoint is None:
+            raise ValueError("--eval-only requires --resume-checkpoint")
+        print("Eval-only mode: skipping training and writing validation metrics.")
+        history = []
+    elif start_epoch >= config.epochs:
         print(
             f"Checkpoint already at epoch {start_epoch}; "
             f"requested epochs={config.epochs}. Nothing to train."
@@ -562,14 +696,15 @@ def main() -> None:
         encoding="utf-8",
     )
     (results_dir / "eval_summary.json").write_text(json.dumps(eval_summary, indent=2), encoding="utf-8")
-    save_checkpoint(
-        model,
-        results_dir,
-        optimizer=optimizer,
-        config=config,
-        epoch=config.epochs,
-        name=stage_checkpoint_name(config.stage if config.stage != "all" else "moe"),
-    )
+    if not config.eval_only:
+        save_checkpoint(
+            model,
+            results_dir,
+            optimizer=optimizer,
+            config=config,
+            epoch=config.epochs,
+            name=stage_checkpoint_name(config.stage if config.stage != "all" else "moe"),
+        )
 
     print("Experiment complete.")
     print(f"Results written to: {results_dir.resolve()}")

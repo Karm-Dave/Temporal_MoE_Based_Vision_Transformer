@@ -1,0 +1,16 @@
+{
+  "loss": 0.939385712146759,
+  "det": 0.9387606978416443,
+  "heatmap": 0.24903200566768646,
+  "cls": 0.5963163673877716,
+  "bbox": 0.04670615680515766,
+  "load_balance": 0.0006249999860301614,
+  "mean_confidence": 0.14968033879995346,
+  "mean_box_width": 0.5050488710403442,
+  "mean_box_height": 0.42316770553588867,
+  "map50": 0.0,
+  "precision50": 0.0,
+  "recall50": 0.0,
+  "eval_ground_truth_boxes": 4.0,
+  "eval_predictions": 16.0
+}

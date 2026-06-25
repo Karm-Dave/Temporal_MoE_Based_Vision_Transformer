@@ -1,5 +1,8 @@
 import torch
+import pytest
+from types import SimpleNamespace
 
+from experiment import MeanAveragePrecision50
 from models import (
     DRISHTIConfig,
     DRISHTIMoE,
@@ -185,8 +188,54 @@ def test_drishti_collator_preserves_frame_targets():
     assert batch["frame_targets"][0][0]["boxes"].shape == (1, 4)
 
 
+def test_map50_reports_perfect_detection():
+    metric = MeanAveragePrecision50()
+    output = SimpleNamespace(
+        boxes=torch.tensor([[[0.5, 0.5, 0.2, 0.2], [0.1, 0.1, 0.1, 0.1]]]),
+        object_logits=torch.tensor([[[8.0], [-8.0]]]),
+    )
+    frame_targets = [
+        [
+            {
+                "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+                "labels": torch.ones(1, dtype=torch.long),
+            }
+        ]
+    ]
+
+    metric.update(output, frame_targets)
+    result = metric.compute()
+
+    assert result["map50"] == 1.0
+    assert result["recall50"] == 1.0
+    assert result["eval_ground_truth_boxes"] == 1.0
+
+
+def test_map50_reports_missed_detection():
+    metric = MeanAveragePrecision50()
+    output = SimpleNamespace(
+        boxes=torch.tensor([[[0.1, 0.1, 0.1, 0.1]]]),
+        object_logits=torch.tensor([[[8.0]]]),
+    )
+    frame_targets = [
+        [
+            {
+                "boxes": torch.tensor([[0.8, 0.8, 0.1, 0.1]]),
+                "labels": torch.ones(1, dtype=torch.long),
+            }
+        ]
+    ]
+
+    metric.update(output, frame_targets)
+    result = metric.compute()
+
+    assert result["map50"] == 0.0
+    assert result["recall50"] == 0.0
+    assert result["eval_predictions"] == 1.0
+
+
 def test_extracted_frame_dataset_reads_image_sequence(tmp_path):
-    import cv2
+    cv2 = pytest.importorskip("cv2")
     import numpy as np
     import json
 

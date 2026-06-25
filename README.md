@@ -136,6 +136,35 @@ results_detector/checkpoints/epoch_020.pt
 results_detector/checkpoints/detector_best.pt
 ```
 
+Validation metrics are written to `eval_summary.json`. Alongside the loss
+terms, the evaluator reports `map50`, `precision50`, and `recall50` using the
+final frame of each Anti-UAV validation window and IoU threshold 0.50.
+
+To recompute validation metrics from an existing checkpoint without training:
+
+```bash
+python experiment.py \
+  --full \
+  --eval-only \
+  --frames-root "/home/newuser1/dataset_frames" \
+  --train-split train \
+  --val-split val \
+  --modality visible \
+  --stage detector \
+  --resume-checkpoint results_detector/checkpoints/latest.pt \
+  --batch-size 8 \
+  --num-workers 4 \
+  --height 448 \
+  --width 448 \
+  --image-channels 3 \
+  --crop-size 64 \
+  --num-crops 8 \
+  --feature-dim 256 \
+  --clip-stride 16 \
+  --device cuda \
+  --results-dir results_detector
+```
+
 If training is interrupted, resume the same stage from `latest.pt`:
 
 ```bash
