@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from drishti_v2.experiments.common import add_common_args, build_loader, build_model, load_config, resolve_device, seed_everything
-from drishti_v2.training import DRISHTILoss, DRISHTITrainer
+from drishti_v2.training import DRISHTITrainer, StageLossFactory
 
 
 STAGE_DEFAULTS = {
@@ -55,7 +55,7 @@ def main() -> None:
         frame_stride=args.frame_stride,
         box_format=args.box_format,
     )
-    loss_fn = DRISHTILoss(w_balance=config.moe_balance_weight)
+    loss_fn = StageLossFactory.make_loss(args.stage, config=config)
     trainer = DRISHTITrainer(model, train_loader, val_loader, loss_fn, output_dir=args.output_dir, device=device)
     defaults = STAGE_DEFAULTS[args.stage]
     history = trainer.fit(

@@ -18,12 +18,15 @@ def apply_training_stage(model: nn.Module, stage: str) -> None:
 
     if stage in {"stage1", "detector"}:
         _set_trainable(model.motion_cnn, True)
+        _set_trainable(model.encoder, True)
         _set_trainable(model.head, True)
+        if getattr(model, "motion_gate", None) is not None:
+            _set_trainable(model.motion_gate, True)
     elif stage in {"stage2", "temporal"}:
         _set_trainable(model.temporal, True)
     elif stage in {"stage3", "moe"}:
         _set_trainable(model.moe, True)
-    elif stage in {"finetune", "e2e", "all"}:
+    elif stage in {"stage4", "finetune", "e2e", "all"}:
         for parameter in model.parameters():
             parameter.requires_grad = True
         model.train()

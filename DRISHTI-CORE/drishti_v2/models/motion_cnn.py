@@ -11,9 +11,10 @@ class MotionCNN(nn.Module):
         self,
         image_channels: int = 3,
         hidden_channels: tuple[int, ...] = (32, 64, 64),
+        in_channels: int | None = None,
     ) -> None:
         super().__init__()
-        in_channels = image_channels * 3
+        in_channels = in_channels or image_channels * 5
         layers: list[nn.Module] = []
         for idx, out_channels in enumerate(hidden_channels):
             layers.extend(

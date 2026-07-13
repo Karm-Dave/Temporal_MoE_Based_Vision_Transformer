@@ -1,1812 +1,1429 @@
-# DRISHTI-CORE v2 — Production Implementation Plan
-**Classification:** Internal Engineering Specification  
-**Version:** 2.0.0  
-**Status:** Approved for Implementation
+# DRISHTI-CORE v2: Master Implementation Plan
 
 ---
 
-## Table of Contents
+# Section 1: Complete Model Architecture
 
-1. [Overview](#1-overview)
-2. [Project Directory Structure](#2-project-directory-structure)
-3. [Dependencies & Environment](#3-dependencies--environment)
-4. [Data Pipeline](#4-data-pipeline)
-5. [Module-by-Module Implementation Blueprint](#5-module-by-module-implementation-blueprint)
-   - 5.1 Config System
-   - 5.2 Local Differential Motion Invariant (LDMI)
-   - 5.3 MotionCNN
-   - 5.4 Multi-Source Crop Proposal Engine
-   - 5.5 Frozen Crop Encoder
-   - 5.6 Temporal Fusion Transformer
-   - 5.7 Sparse Mixture-of-Experts
-   - 5.8 Detection Head
-   - 5.9 Full Pipeline
-   - 5.10 Inference Tracker
-6. [Loss Functions](#6-loss-functions)
-7. [Activation Functions](#7-activation-functions)
-8. [Hyperparameter Specification & Justification](#8-hyperparameter-specification--justification)
-9. [Staged Training Procedure](#9-staged-training-procedure)
-10. [Evaluation Protocol](#10-evaluation-protocol)
-11. [Ablation Study Design](#11-ablation-study-design)
-12. [Baseline Comparisons](#12-baseline-comparisons)
-13. [Failure Case Analysis](#13-failure-case-analysis)
-14. [Compute Budget Plan](#14-compute-budget-plan)
-15. [Reproducibility Checklist](#15-reproducibility-checklist)
-
----
-
-## 1. Overview
-
-### 1.1 The Problem Statement
-Standard video object detectors fail on tiny UAV targets captured by a moving camera because:
-1. They confuse camera-induced background motion with target motion.
-2. They cannot detect targets that are stationary in pixel space while the camera follows them.
-3. They use non-causal future frames, preventing real-time deployment.
-4. They lack a re-acquisition mechanism for targets occluded by structures.
-
-### 1.2 Our Solution in One Paragraph
-DRISHTI-CORE v2 decouples background motion from target motion using a **parameter-free Local Differential Motion Invariant (LDMI)** layer applied before any learned component. A **MotionCNN** converts the filtered signal into a spatial anomaly heatmap. An **adaptive crop proposal engine** allocates 8 crops per frame across four sources — tracker-guided, heatmap-driven, frame-edge surveillance, and periodic interior scanning — ensuring complete spatial coverage without redundant computation. A **frozen crop encoder** maps visual patches to feature vectors. A **causal temporal fusion transformer** integrates temporal context across 5 past frames. A **sparse top-2 MoE** provides model capacity at low active parameter cost. A **detection head** regresses bounding boxes and objectness. An **inference-time tracker** maintains multi-target state and feeds predicted coordinates back into the crop engine. Every component operates causally (zero look-ahead).
-
-### 1.3 Implementation Philosophy
-- **From Scratch:** No dependency on any pre-existing DRISHTI codebase. This plan defines the complete implementation starting point.
-- **Production Quality:** Every module is a standalone, testable, documented class. Every public method has a typed signature.
-- **Reproducible:** Fixed seeds, logged hyperparameters, deterministic data loading.
-- **Modular by Design:** You can swap out any module (e.g., replace MotionCNN with an optical-flow estimate) without touching other modules.
-
----
-
-## 2. Project Directory Structure
+## 1.1 Full Forward Pass Data Flow
 
 ```
-drishti_v2/
-│
-├── configs/                          # All YAML configuration files
-│   ├── default.yaml                  # Base config
-│   ├── ablation_no_ldmi.yaml
-│   ├── ablation_no_edge_crops.yaml
-│   ├── ablation_dense_moe.yaml
-│   ├── ablation_e2e_training.yaml
-│   └── sweep_crops_and_period.yaml
-│
-├── data/                             # Data loading and preprocessing
-│   ├── __init__.py
-│   ├── dataset.py                    # AntiUAVDataset class
-│   ├── collator.py                   # DRISHTICollator class
-│   ├── augmentations.py              # VideoAugmentation class
-│   └── utils.py                      # box format conversions, normalization
-│
-├── models/                           # All model modules
-│   ├── __init__.py
-│   ├── config.py                     # DRISHTIConfig dataclass
-│   ├── ldmi.py                       # LocalDifferentialMotion class
-│   ├── motion_cnn.py                 # MotionCNN class
-│   ├── crop_proposal.py              # CropProposalEngine class
-│   ├── crop_encoder.py               # CropEncoder class
-│   ├── temporal_fusion.py            # CausalTemporalFusion class
-│   ├── moe.py                        # SparseMoE + Expert classes
-│   ├── detection_head.py             # DetectionHead class
-│   └── pipeline.py                   # DRISHTIPipeline (assembles all above)
-│
-├── tracker/
-│   ├── __init__.py
-│   └── tracker.py                    # Track + SimpleTracker classes
-│
-├── training/
-│   ├── __init__.py
-│   ├── losses.py                     # All loss functions
-│   ├── trainer.py                    # DRISHTITrainer class
-│   ├── scheduler.py                  # LR scheduler factory
-│   └── stage_control.py             # Freeze/unfreeze logic per stage
-│
-├── evaluation/
-│   ├── __init__.py
-│   ├── metrics.py                    # All metric computations
-│   ├── evaluator.py                  # DRISHTIEvaluator class
-│   └── visualize.py                  # Bounding box & heatmap visualization
-│
-├── experiments/
-│   ├── __init__.py
-│   ├── run_training.py               # Main training entry point
-│   ├── run_eval.py                   # Standalone evaluation script
-│   ├── run_ablation.py               # Ablation sweep runner
-│   └── run_inference.py              # Real-time inference script
-│
-├── tests/
-│   ├── test_ldmi.py
-│   ├── test_motion_cnn.py
-│   ├── test_crop_proposal.py
-│   ├── test_temporal_fusion.py
-│   ├── test_moe.py
-│   ├── test_detection_head.py
-│   ├── test_pipeline.py
-│   ├── test_tracker.py
-│   └── test_losses.py
-│
-├── scripts/
-│   ├── download_antiuav.sh          # Dataset download helper
-│   ├── prepare_dataset.py           # Frame extraction & annotation parsing
-│   └── benchmark_latency.py         # FPS/GFLOPs profiling script
-│
-├── checkpoints/                      # Saved model weights (gitignored)
-├── logs/                             # TensorBoard / W&B logs (gitignored)
-├── results/                          # Evaluation outputs, CSVs, plots
-│
-├── requirements.txt
-├── setup.py
-└── README.md
+Input: frames [B, T=5, C=3, H=448, W=448]
+                │
+    ┌───────────▼───────────────────────────────────────────────────┐
+    │  Per-frame loop  (t = 0 → T−1)                               │
+    │                                                               │
+    │  Step 1: Triplet Construction                                 │
+    │  [B, 9, 448, 448]  ← cat(f_{t-2}, f_{t-1}, f_t)            │
+    │                                                               │
+    │  Step 2: LDMI v2  (parameter-free)                           │
+    │  [B, 15, 448, 448] ← signed residuals + magnitudes           │
+    │                       + scale maps + transition cues          │
+    │                                                               │
+    │  Step 3: MotionCNN                                            │
+    │  [B, 1, 112, 112]  ← motion heatmap                         │
+    │                                                               │
+    │  Step 4: MotionGate                                           │
+    │  [B]               ← motion confidence score                 │
+    │           │                                                   │
+    │      trust? ──── YES ──► CropProposalEngine (selective K=8)  │
+    │           └──── NO  ──► CropProposalEngine (dense K=16)     │
+    │                                                               │
+    │  Step 5: CropEncoder                                          │
+    │  [B, K, 256]       ← per-crop CNN features                  │
+    │                                                               │
+    │  Step 6: Augment                                             │
+    │  [B, K, 257]       ← cat(encoded, heatmap_score)            │
+    └───────────────────────────────────────────────────────────────┘
+                │
+    ┌───────────▼───────────────────────────────────────────────────┐
+    │  Step 7: CausalTemporalFusion                                 │
+    │  [B, T, K, 257] → [B, K, 256]                               │
+    │  Causal transformer: each crop-track reads its past          │
+    └───────────────────────────────────────────────────────────────┘
+                │
+    ┌───────────▼───────────────────────────────────────────────────┐
+    │  Step 8: SparseMoE                                            │
+    │  [B, K, 256] → [B, K, 256]                                  │
+    │  Top-2 of 8 experts per crop token                           │
+    └───────────────────────────────────────────────────────────────┘
+                │
+    ┌───────────▼───────────────────────────────────────────────────┐
+    │  Step 9: DetectionHead                                        │
+    │  [B, K, 256] → objectness [B, K, 1] + crop_boxes [B, K, 4] │
+    └───────────────────────────────────────────────────────────────┘
+                │
+    ┌───────────▼───────────────────────────────────────────────────┐
+    │  Step 10: Global Box Mapping                                  │
+    │  crop_boxes [B, K, 4] → boxes [B, K, 4]  (full-frame coords)│
+    └───────────────────────────────────────────────────────────────┘
+
+Output: PipelineOutput (heatmap, boxes, objectness_logits, ...)
 ```
 
 ---
 
-## 3. Dependencies & Environment
+## 1.2 Module-by-Module Architecture Reference
 
-### 3.1 `requirements.txt`
+### Module 1: LocalDifferentialMotion (LDMI v2)
+
+**File**: [ldmi.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/ldmi.py)
+**Parameters**: 0 (fully parameter-free)
+**Input**: `[B, 9, H, W]` — triplet of 3 frames concatenated along channel axis
+**Output**: `[B, 15, H, W]`
+
+| Op | Description | Output shape |
+|---|---|---|
+| Split triplet | `f_old, f_prev, f_curr = triplet.split(3, dim=1)` | `3 × [B, 3, H, W]` |
+| `d_old = f_prev − f_old` | Raw frame difference, past interval | `[B, 3, H, W]` |
+| `d_new = f_curr − f_prev` | Raw frame difference, recent interval | `[B, 3, H, W]` |
+| `avg_pool2d(d, k)` for k ∈ {7,15,31,63} | Local mean at 4 scales | `4 × [B, 3, H, W]` |
+| `r = d − local_mean` (signed) | Signed residual at each scale | `4 × [B, 3, H, W]` |
+| `argmax(abs(r), dim=scales)` | Pick best-responding scale per pixel | `[B, 3, H, W]` index |
+| `r_old, r_new` | Sign-preserving max-abs residual | `2 × [B, 3, H, W]` |
+| `m_old = ‖d_old‖₂`, `m_new = ‖d_new‖₂` | Raw motion magnitude | `2 × [B, 1, H, W]` |
+| `s_old, s_new` = normalised scale index | Object size hint | `2 × [B, 1, H, W]` |
+| `D = relu(r̂_old − r̂_new)` | Disappearance (occlusion cue) | `[B, 1, H, W]` |
+| `A = relu(r̂_new − r̂_old)` | Appearance (new object cue) | `[B, 1, H, W]` |
+| `cat([r_old, m_old, s_old, f_curr, s_new, m_new, r_new, D, A])` | Final output | `[B, 15, H, W]` |
+
+**Output channel breakdown** (RGB, C=3):
+
 ```
-# Core deep learning
-torch>=2.1.0
-torchvision>=0.16.0
-torchaudio>=2.1.0
-
-# Video & image processing
-opencv-python-headless>=4.8.0
-Pillow>=10.0.0
-imageio>=2.31.0
-
-# Scientific computing
-numpy>=1.24.0
-scipy>=1.11.0
-
-# Data loading & management
-pycocotools>=2.0.7
-h5py>=3.9.0
-
-# Configuration management
-omegaconf>=2.3.0
-hydra-core>=1.3.0
-
-# Experiment tracking
-tensorboard>=2.14.0
-wandb>=0.15.0
-
-# Evaluation
-torchmetrics>=1.2.0
-motmetrics>=1.4.0    # for Multi-Object Tracking metrics
-
-# Profiling & benchmarking
-fvcore>=0.1.5.post20221221    # for FLOPs counting
-thop>=0.1.1                   # alternative FLOPs counter
-
-# Utilities
-tqdm>=4.66.0
-pyyaml>=6.0.1
-matplotlib>=3.7.0
-seaborn>=0.12.0
-pandas>=2.0.0
-tabulate>=0.9.0
-
-# Code quality
-pytest>=7.4.0
-black>=23.9.0
-isort>=5.12.0
-mypy>=1.5.0
-```
-
-### 3.2 Python & CUDA
-- Python: 3.10+
-- CUDA: 11.8+ (for PyTorch 2.x)
-- Recommended: `conda env create -f environment.yml`
-
-### 3.3 Environment Setup Commands
-```bash
-conda create -n drishti python=3.10
-conda activate drishti
-pip install -r requirements.txt
-python setup.py develop
+Ch  0– 2:  r_old  (signed motion contrast, past interval)
+Ch  3:     m_old  (raw L2 motion magnitude, past interval)
+Ch  4:     s_old  (normalised best-scale index, past interval)
+Ch  5– 7:  f_curr (current frame appearance)
+Ch  8:     s_new  (normalised best-scale index, recent interval)
+Ch  9:     m_new  (raw L2 motion magnitude, recent interval)
+Ch 10–12:  r_new  (signed motion contrast, recent interval)
+Ch 13:     D      (disappearance / occlusion onset)
+Ch 14:     A      (appearance / new object onset)
 ```
 
 ---
 
-## 4. Data Pipeline
+### Module 2: MotionCNN
 
-### 4.1 `data/dataset.py` — `AntiUAVDataset`
+**File**: [motion_cnn.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/motion_cnn.py)
+**Parameters**: ~50K (updated first layer adds ~1,728 params)
+**Input**: `[B, 15, 448, 448]`
+**Output**: `[B, 1, 112, 112]`
 
-**Class Purpose:** Load Anti-UAV RGB video sequences as fixed-length temporal windows with their annotations.
+| Layer | Op | Input → Output | Notes |
+|---|---|---|---|
+| conv1 | Conv2d(15→32, k=3, s=2, p=1) + BN + ReLU | `[B,15,448,448]→[B,32,224,224]` | Was 9→32 |
+| conv2 | Conv2d(32→64, k=3, s=2, p=1) + BN + ReLU | `[B,32,224,224]→[B,64,112,112]` | Unchanged |
+| conv3 | Conv2d(64→64, k=3, s=1, p=1) + BN + ReLU | `[B,64,112,112]→[B,64,112,112]` | Unchanged |
+| conv4 | Conv2d(64→1, k=1) + Sigmoid | `[B,64,112,112]→[B,1,112,112]` | Unchanged |
+
+**Training supervision**: GT heatmaps are Gaussian blobs (σ=2) at GT box centers, at 1/4 resolution.
+
+---
+
+### Module 3: MotionGate
+
+**File**: `drishti_v2/models/motion_gate.py` *(NEW)*
+**Parameters**: 129
+**Input**: `[B, 1, 112, 112]` — heatmap from MotionCNN
+**Output**: `[B]` — confidence ∈ (0, 1)
+
+| Step | Op | Output |
+|---|---|---|
+| Flatten heatmap | `h = heatmap.view(B, -1)` | `[B, 12544]` |
+| Extract 6 stats | max, mean, std, entropy, top1−top2 gap, active fraction | `[B, 6]` |
+| MLP layer 1 | Linear(6→16) + ReLU | `[B, 16]` |
+| MLP layer 2 | Linear(16→1) + Sigmoid | `[B, 1]` |
+| Squeeze | `.squeeze(-1)` | `[B]` |
+
+**Decision**: if `confidence < threshold (default 0.5)` → use dense crop mode.
+
+---
+
+### Module 4: CropProposalEngine
+
+**File**: [crop_proposal.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/crop_proposal.py)
+**Parameters**: 0 (pure algorithmic)
+
+**Selective mode** (normal, K=8):
+```
+Priority fill order:
+  1. GUIDED  (tracker predictions)  → up to 6 slots
+  2. GRID    (fixed positions)       → up to 4 slots (every scan_period=4 frames)
+  3. EDGE    (frame borders)         → up to 2 slots
+  4. MOTION  (heatmap NMS peaks)     → remaining slots
+  5. PAD     (frame center)          → fill remaining
+```
+
+**Dense mode** (fallback, K=16 for grid_size=4):
+```
+Priority fill order:
+  1. GUIDED  (tracker predictions)   → up to available slots
+  2. GRID    (4×4 uniform grid)      → fill remaining
+     Positions: (i/(n+1), j/(n+1)) for i,j ∈ {1,2,3,4}
+```
+
+**Crop extraction**: `_extract_crops(frame, centers)` — bilinear interpolate a 64×64 patch from the full-res frame at each center location.
+
+**Output**:
+- `crops`: `[B×K, 3, 64, 64]`
+- `centers`: `[B, K, 2]` — normalised (cx, cy)
+- `scores`: `[B, K]` — heatmap value at each center
+- `source_labels`: `[B, K]` — integer in {0=MOTION, 1=EDGE, 2=GRID, 3=GUIDED, 4=PAD}
+
+---
+
+### Module 5: CropEncoder
+
+**File**: [crop_encoder.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/crop_encoder.py)
+**Parameters**: ~300K
+**Input**: `[B×K, 3, 64, 64]`
+**Output**: `[B, K, 256]`
+
+| Layer | Op | Input → Output |
+|---|---|---|
+| conv1 | Conv2d(3→32, k=3, s=1, p=1) + BN + ReLU | `[B×K,3,64,64]→[B×K,32,64,64]` |
+| conv2 | Conv2d(32→64, k=3, s=2, p=1) + BN + ReLU | `[B×K,32,64,64]→[B×K,64,32,32]` |
+| conv3 | Conv2d(64→128, k=3, s=2, p=1) + BN + ReLU | `[B×K,64,32,32]→[B×K,128,16,16]` |
+| pool | AdaptiveAvgPool2d(1) | `[B×K,128,16,16]→[B×K,128,1,1]` |
+| flatten | `.view(B×K, 128)` | `[B×K,128]` |
+| fc | Linear(128→256) + ReLU | `[B×K,256]` |
+| reshape | `.view(B, K, 256)` | `[B,K,256]` |
+
+After encoding: append heatmap score → `[B, K, 257]`.
+
+---
+
+### Module 6: CausalTemporalFusion
+
+**File**: [temporal_fusion.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/temporal_fusion.py)
+**Parameters**: ~500K
+**Input**: `[B, T=5, K=8, 257]`
+**Output**: `[B, K=8, 256]`
+
+| Layer | Op | Input → Output |
+|---|---|---|
+| reshape | `[B,T,K,D]→[B*K,T,D]` | `[B*K, 5, 257]` |
+| input_proj | Linear(257→256) + pos_embed | `[B*K, 5, 256]` |
+| causal mask | upper-triangular bool mask | `[5, 5]` |
+| TransformerEncoder | 2 layers, nhead=4, ffn=512 | `[B*K, 5, 256]` |
+| extract present | `encoded[:, -1]` | `[B*K, 256]` |
+| LayerNorm | normalize | `[B*K, 256]` |
+| reshape | `.view(B, K, 256)` | `[B, K, 256]` |
+
+**Current limitation** (noted for future work): reshaping forces crop index k at time t to attend only to crop k at past times. The index assignment is arbitrary and can mismatch when CropProposalEngine re-proposes different locations each frame.
+
+---
+
+### Module 7: SparseMoE
+
+**File**: [moe.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/moe.py)
+**Parameters**: ~1.1M (router + 8 experts)
+**Input**: `[B, K=8, 256]`
+**Output**: `[B, K=8, 256]` + `MoEDiagnostics`
+
+| Sub-module | Architecture | Params |
+|---|---|---|
+| Router | Linear(256→8, bias=False) | 2,048 |
+| Expert × 8 | Linear(256→512) + GELU + Dropout(0.1) + Linear(512→256) | 8 × 131,584 = 1,052,672 |
+| **Total** | — | **~1.05M** |
+
+**Routing forward pass**:
+1. Flatten: `x_flat = x.reshape(B*K, 256)` → `[N=B*K, 256]`
+2. Router logits: `logits = router(x_flat)` → `[N, 8]`
+3. Probabilities: `probs = softmax(logits)` → `[N, 8]`
+4. Top-2 selection: `top_probs, top_indices = probs.topk(2)` → `[N, 2]`
+5. Normalise: `top_weights = top_probs / sum(top_probs)`
+6. Expert computation: `out[i] = w1 * expert_a(x_i) + w2 * expert_b(x_i)`
+7. Reshape: `.view(B, K, 256)`
+
+**Diagnostics** (all computed here, passed to loss functions):
+- `balance_loss` (current, used everywhere)
+- `router_entropy` (existing logging field)
+- `router_logits` (NEW — needed for z-loss in Stage 3)
+
+---
+
+### Module 8: DetectionHead
+
+**File**: [detection_head.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/detection_head.py)
+**Parameters**: ~130K
+**Input**: `[B, K, 256]`
+**Output**: `objectness_logits [B, K, 1]` + `crop_boxes [B, K, 4]`
+
+| Branch | Architecture |
+|---|---|
+| Objectness | LayerNorm(256) → Linear(256→1) → (raw logit) |
+| Box | LayerNorm(256) → Linear(256→256) → GELU → Linear(256→4) → Sigmoid |
+
+Box output is in crop-relative normalised coordinates `[cx, cy, w, h] ∈ [0, 1]`.
+
+---
+
+### Module 9: SimpleTracker (Inference Only)
+
+**File**: [tracker.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/tracker/tracker.py)
+**Parameters**: 0 (algorithmic)
+
+At inference only — not used during training.
+
+| Step | Operation |
+|---|---|
+| `predict()` | Move each track center by its velocity estimate: `center += velocity` |
+| `update(boxes, logits)` | Match detections to tracks by Euclidean distance (threshold=0.15) |
+| New tracks | Birth for unmatched detections with score > 0.3 |
+| Dead tracks | Kill tracks not matched for >15 frames (`max_coast=15`) |
+| `get_guided_centers()` | Return `[1, num_tracks, 2]` of predicted positions → CropProposalEngine GUIDED slot |
+
+---
+
+# Section 2: LDMI v2 + Adaptive Gating Changes
+
+## 2.1 Summary of All Code Changes (LDMI + Gating)
+
+| File | Action | Lines Affected | New Params |
+|---|---|---|---|
+| [ldmi.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/ldmi.py) | Full rewrite | All 46 lines | 0 |
+| [motion_cnn.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/motion_cnn.py) | `in_channels` 9→15 | Line 16 | +1,728 |
+| **motion_gate.py** | **NEW FILE** | — | 129 |
+| [crop_proposal.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/crop_proposal.py) | Add `forward_dense()` | After line 64 | 0 |
+| [pipeline.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/pipeline.py) | Wire gate + adaptive mode | Lines 37–170 | 0 |
+| [config.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/config.py) | Add 4 new fields, update scales | Lines 18–30 | — |
+| [stage_control.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/stage_control.py) | Include `motion_gate` in stage1 | Line 22 | — |
+| [\_\_init\_\_.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/__init__.py) | Export `MotionGate` | Lines 3–7 | — |
+
+Mathematical derivations: see [implementation_plan.md](file:///C:/Users/jaygo/.gemini/antigravity/brain/e6394a49-7659-4c6f-8105-8369feb56fae/implementation_plan.md) sections 1.2–1.5.
+
+---
+
+# Section 3: Stage-Specific Loss Functions
+
+## 3.1 Mathematical Definition of All Loss Primitives
+
+### 3.1.1 Sigmoid Focal Loss (replaces BCE in all stages)
+
+**Problem with current BCE at [losses.py line 71](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/losses.py#L71)**:
 
 ```python
-class AntiUAVDataset(torch.utils.data.Dataset):
-    """
-    Anti-UAV dataset loader for temporal video windows.
-    
-    Expected directory layout:
-        data_root/
-            train/
-                <sequence_name>/
-                    visible/
-                        000000.jpg
-                        000001.jpg
-                        ...
-                    visible.json   # {"gt_rect": [[x,y,w,h],...], "exist": [1,1,0,...]}
-            val/
-                ...
-            test/
-                ...
-    
-    Every item returned is a temporal clip of length `num_frames` with
-    the ground-truth annotation for every frame in the clip.
-    """
-    
-    def __init__(
-        self,
-        data_root: str,
-        split: str,                       # "train" | "val" | "test"
-        num_frames: int = 5,              # Temporal window length
-        frame_size: tuple[int, int] = (448, 448),
-        clip_stride: int = 4,             # Stride between clips
-        frame_stride: int = 1,            # Stride between frames within a clip
-        modality: str = "visible",        # "visible" | "infrared"
-        box_format: str = "xywh",         # Input annotation format
-        augment: bool = True,
-        sequence_filter: list[str] | None = None,  # Filter to specific sequences
-    ) -> None:
-        ...
-
-    def __len__(self) -> int:
-        ...
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        """
-        Returns:
-            {
-                "frames": Tensor [num_frames, 3, H, W],   # normalized [0,1]
-                "targets": list[dict],                     # per-frame GT
-                    each dict: {
-                        "boxes": Tensor [N, 4],            # normalized [cx,cy,w,h]
-                        "labels": Tensor [N],              # all 1s (drone class)
-                        "visible": bool,                   # is target visible?
-                    }
-                "meta": {
-                    "sequence": str,
-                    "frame_indices": list[int],
-                }
-            }
-        """
-        ...
+cls_loss = F.binary_cross_entropy_with_logits(output.objectness_logits, labels)
 ```
 
-### 4.2 `data/collator.py` — `DRISHTICollator`
+BCE treats all K crops equally. With K=8 and typically 1 positive crop (the one containing the UAV), the ratio is 7:1 negative:positive. The network learns to predict "no object" everywhere — this minimises loss because 7/8 labels are zero and predicting zero is always correct for them.
+
+**Focal Loss** (Lin et al., RetinaNet 2017):
+
+$$\text{FL}(p_t) = -\alpha_t (1 - p_t)^\gamma \log(p_t)$$
+
+where $p_t = \sigma(\text{logit})$ if label=1, else $p_t = 1 - \sigma(\text{logit})$, and:
+- $(1 - p_t)^\gamma$ is the **modulating factor** — when the model predicts correctly with high confidence ($p_t \to 1$), this term $\to 0$ and the loss is down-weighted. When the model is wrong or uncertain, the loss stays high.
+- $\alpha_t$ is the class-balance weight: $\alpha$ for positives, $1-\alpha$ for negatives.
+
+**Effect**: Easy, well-classified negatives contribute negligibly to gradient. Hard misclassified examples dominate training.
+
+**With our crop setup** (K=8, ~1-2 positives):
+- At initialization, model predicts $p \approx 0.5$ everywhere. Negative BCE gradient is $0.5$ per sample → all 7 negatives contribute as much as the 1 positive.
+- With Focal ($\gamma=2$): same initialization gives modulating factor $(1-0.5)^2 = 0.25$ → negatives contribute $0.25\times$ as much. After a few epochs, easy negatives are down-weighted further.
+
+**Recommended values**: $\gamma = 2.0$, $\alpha = 0.25$ (positives are up-weighted since they're rare).
+
+**Numerically stable implementation**:
+$$\text{FL}(\text{logit}, y) = \alpha_t \cdot (1-p_t)^\gamma \cdot \max(\text{logit}, 0) - \text{logit} \cdot y + \log(1 + e^{-|\text{logit}|})$$
+
+This avoids computing $\sigma(\text{logit})$ directly, which can overflow.
+
+---
+
+### 3.1.2 Heatmap Focal Loss (replaces MSE on heatmaps)
+
+**Problem with current MSE at [losses.py line 68](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/losses.py#L68)**:
 
 ```python
-class DRISHTICollator:
-    """Collates variable-length target lists into padded batch tensors."""
-    
-    def __call__(self, batch: list[dict]) -> dict[str, Any]:
-        """
-        Returns:
-            {
-                "frames": Tensor [B, T, 3, H, W],
-                "targets": list[list[dict]],     # [B][T] — not padded, left as lists
-                "meta": list[dict],
-            }
-        """
-        ...
+heatmap_loss = F.mse_loss(output.heatmap, gt_heatmap)
 ```
 
-### 4.3 `data/augmentations.py` — `VideoAugmentation`
+MSE treats all pixels equally. The GT heatmap has Gaussian peaks (σ=2) at GT centers and zeros everywhere else. The heatmap is 112×112 = 12,544 pixels. The Gaussian with σ=2 covers roughly $\pi \times 6^2 \approx 113$ pixels. So ~99% of pixels are zero in the GT.
+
+MSE penalises any predicted pixel > 0 in the background equally with any predicted pixel < 1 at the peak center. There is no distinction between "almost-background" and "peak region."
+
+**CornerNet/CenterNet Heatmap Focal Loss** (Law & Deng 2018):
+
+For each pixel $(x,y)$, let $\hat{y}_{xy}$ be the predicted heatmap value and $y_{xy}$ be the GT value:
+
+$$\mathcal{L}_{\text{hm}} = \frac{-1}{N} \sum_{x,y} \begin{cases} (1 - \hat{y}_{xy})^\alpha \log(\hat{y}_{xy}) & \text{if } y_{xy} = 1 \\ (1 - y_{xy})^\beta (\hat{y}_{xy})^\alpha \log(1 - \hat{y}_{xy}) & \text{otherwise} \end{cases}$$
+
+where $N$ = number of GT keypoints (objects), $\alpha = 2$, $\beta = 4$.
+
+**Key mechanics**:
+- **Peak pixels** ($y_{xy} = 1$): Standard log-loss, but $(1 - \hat{y})^\alpha$ down-weights easy cases (when $\hat{y} \approx 1$ already, $(1-1)^2 = 0$ contribution).
+- **Background pixels near the peak** ($y_{xy} \in (0, 1)$ from Gaussian falloff): $(1 - y_{xy})^\beta$ suppresses the penalty. A pixel with $y_{xy} = 0.5$ (half-way up the Gaussian) contributes $(1-0.5)^4 = 0.0625\times$ the normal penalty.
+- **Background pixels far from peaks** ($y_{xy} \approx 0$): $(1 - 0)^4 = 1$ full penalty. The network must predict near-zero here.
+
+**Why $\beta=4$**: Aggressively suppresses penalty in the Gaussian falloff region. The model is not punished for "leaking" some heatmap activation near (but not at) a GT center.
+
+---
+
+### 3.1.3 Complete IoU Loss (replaces Smooth L1)
+
+**Problem with current Smooth L1 at [losses.py line 74](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/losses.py#L74)**:
 
 ```python
-class VideoAugmentation:
+bbox_loss = F.smooth_l1_loss(output.crop_boxes[positive], box_targets[positive])
+```
+
+Smooth L1 treats each coordinate independently. It does not know that $(cx, cy, w, h)$ form a geometric box — a small error in $cx$ has the same cost as the same error in $w$, regardless of the IoU consequence.
+
+**CIoU Loss** (Zheng et al., 2020):
+
+$$\mathcal{L}_{\text{CIoU}} = 1 - \text{IoU} + \frac{\rho^2(\mathbf{b}, \mathbf{b}^{gt})}{c^2} + \alpha_v \cdot v$$
+
+where:
+
+**IoU term**:
+$$\text{IoU} = \frac{|\mathbf{b} \cap \mathbf{b}^{gt}|}{|\mathbf{b} \cup \mathbf{b}^{gt}|}$$
+
+**Center distance penalty**:
+$$\frac{\rho^2(\mathbf{b}, \mathbf{b}^{gt})}{c^2} = \frac{(cx - cx^{gt})^2 + (cy - cy^{gt})^2}{c^2}$$
+
+where $c$ = diagonal of the smallest box enclosing both predictions and GT.
+
+This term is **zero only when centers coincide**, and is normalized by the enclosing diagonal so it's scale-invariant. It drives the predicted center toward the GT center even when IoU = 0 (no overlap at all — Smooth L1 still provides gradient, but it's coordinate-wise, not geometry-aware).
+
+**Aspect ratio consistency**:
+$$v = \frac{4}{\pi^2}\left(\arctan\frac{w^{gt}}{h^{gt}} - \arctan\frac{w}{h}\right)^2$$
+
+$$\alpha_v = \frac{v}{(1 - \text{IoU}) + v}$$
+
+$v$ measures the difference in aspect ratio. $\alpha_v$ is an adaptive trade-off: when IoU is already high, aspect ratio correction is emphasized. When IoU is low (boxes don't overlap), center alignment is prioritized.
+
+**Why CIoU over GIoU or DIoU**:
+- GIoU: only adds a penalty for the non-overlapping area — doesn't penalize misaligned centers when boxes overlap.
+- DIoU: adds center distance but no aspect ratio — can converge to wrong proportions.
+- CIoU: center distance + aspect ratio + IoU — all three geometric properties.
+
+**Our setting**: Boxes are in crop-relative $[cx, cy, w, h] \in [0, 1]^4$ coordinates. CIoU is invariant to scale, so the crop-relative space is fine. The "enclosing diagonal" $c$ is computed in this same normalised space.
+
+---
+
+### 3.1.4 Motion Displacement Loss (Stage 1 only)
+
+**Goal**: Validate that the LDMI + MotionCNN pipeline captures the **direction and magnitude** of UAV motion, not just its position at a single frame.
+
+**Formulation**:
+
+For consecutive frames $t$ and $t-1$ within a clip, let:
+- $\hat{\mathbf{p}}_t \in \mathbb{R}^2$ = predicted heatmap peak location at time $t$ (argmax of heatmap, in normalised coords)
+- $\mathbf{g}_t \in \mathbb{R}^2$ = GT box center at time $t$ (from annotation)
+
+Define **predicted displacement** between consecutive frames:
+$$\hat{\mathbf{d}}_t = \hat{\mathbf{p}}_t - \hat{\mathbf{p}}_{t-1}$$
+
+Define **GT displacement**:
+$$\mathbf{d}_t = \mathbf{g}_t - \mathbf{g}_{t-1}$$
+
+**Motion Displacement Loss** over all T−1 consecutive pairs:
+$$\mathcal{L}_{\text{motion}} = \frac{1}{T-1} \sum_{t=1}^{T-1} \left\|\hat{\mathbf{d}}_t - \mathbf{d}_t\right\|_2^2$$
+
+**What this forces**: If the heatmap peak at t=0 is at (0.45, 0.62) and at t=1 is at (0.47, 0.64), the predicted displacement is (+0.02, +0.02). If the GT displacement is (+0.02, +0.02), the loss is zero. If the peak drifts due to noise/false response, the loss is nonzero.
+
+**Implementation requirement**: The loss must receive targets for **all frames**, not just the last frame. Current `_last_targets()` pattern at [losses.py line 27](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/losses.py#L27) must be extended.
+
+> [!WARNING]
+> `argmax` on the heatmap is non-differentiable. Two options:
+> 1. **Soft argmax** (differentiable): $\hat{\mathbf{p}} = \sum_{xy} \text{softmax}(\mathcal{H} / \tau)_{xy} \cdot (x, y)$. With small temperature $\tau$, this approximates argmax while remaining differentiable.
+> 2. **Stop-gradient on peak, L2 on heatmap near peak**: Compute non-differentiable argmax, then penalise the heatmap value at that location relative to adjacent locations. Less clean but faster.
+>
+> **Recommendation**: Option 1 (soft argmax, $\tau = 0.1$).
+
+---
+
+### 3.1.5 Temporal Consistency Loss (Stage 2 only)
+
+**Goal**: Penalise objectness score flickering — a crop that contains the UAV at time $t$ should also have high objectness at time $t-1$ if the UAV was there.
+
+**Formulation**:
+
+Let $s_t^{(k)} = \sigma(\text{logit}_t^{(k)}) \in (0,1)$ be the objectness score for crop $k$ at time $t$.
+
+$$\mathcal{L}_{\text{consist}} = \frac{1}{K(T-1)} \sum_{k=1}^{K} \sum_{t=1}^{T-1} \left(s_t^{(k)} - s_{t-1}^{(k)}\right)^2$$
+
+This is the **squared score difference** between adjacent frames for the same crop index.
+
+**Issue with this formulation**: Crop $k$ at time $t$ and crop $k$ at time $t-1$ may be at different spatial locations (the re-proposal problem). A score change may be geometrically valid if the crop moved.
+
+**Mitigation**: Weight the loss by the spatial proximity of the two crops:
+
+$$w_{t,k} = \exp\left(-\frac{\|\mathbf{c}_t^{(k)} - \mathbf{c}_{t-1}^{(k)}\|_2^2}{2\sigma_{\text{spatial}}^2}\right)$$
+
+Crops that moved far (different proposals) contribute little. Crops that stayed near the same location (stable proposals or GUIDED crops) contribute fully.
+
+$$\mathcal{L}_{\text{consist}} = \frac{1}{K(T-1)} \sum_{k,t} w_{t,k} \cdot \left(s_t^{(k)} - s_{t-1}^{(k)}\right)^2$$
+
+**Effect**: Reduces detection flickering ("object present → absent → present" oscillation over frames), which directly improves tracking stability.
+
+---
+
+### 3.1.6 Trajectory Smoothness Loss (Stage 2 only)
+
+**Goal**: Penalise physically impossible accelerations in the predicted box trajectory. UAVs have bounded accelerations — sudden jumps between frames indicate prediction errors, not real motion.
+
+**Formulation**:
+
+For each crop $k$ across frames, define:
+
+$$\Delta_t^{(k)} = \mathbf{box}_t^{(k)} - \mathbf{box}_{t-1}^{(k)} \quad \text{(velocity at time } t\text{)}$$
+
+$$\Delta^2_t{}^{(k)} = \Delta_t^{(k)} - \Delta_{t-1}^{(k)} \quad \text{(acceleration at time } t\text{)}$$
+
+$$\mathcal{L}_{\text{smooth}} = \frac{1}{K(T-2)} \sum_{k=1}^{K} \sum_{t=2}^{T-1} \left\|\Delta^2_t{}^{(k)}\right\|_2^2$$
+
+Minimising this encourages **constant-velocity prediction** — the predicted box positions form a straight trajectory unless the model has strong evidence for curvature.
+
+**Important**: Only apply to positive crops (crops assigned a GT box). Penalising acceleration of background crops is meaningless.
+
+$$\mathcal{L}_{\text{smooth}} = \frac{1}{\sum_k \mathbf{1}[\text{pos}_k] \cdot (T-2)} \sum_{\text{pos } k} \sum_{t=2}^{T-1} \left\|\Delta^2_t{}^{(k)}\right\|_2^2$$
+
+---
+
+### 3.1.7 Router Z-Loss (Stage 3 only)
+
+**Problem**: The router at [moe.py line 69](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/moe.py#L69) can produce arbitrarily large logits. After softmax, large logits cause near-one routing probabilities for the top expert — the router becomes deterministic and stops load-balancing. This also causes numerical instability in the softmax computation (overflow).
+
+**Router Z-Loss** (ST-MoE, Zoph et al. 2022):
+
+$$\mathcal{L}_z = \frac{1}{N} \sum_{i=1}^{N} \left(\log \sum_{j=1}^{E} e^{x_{ij}}\right)^2$$
+
+where $x_{ij}$ are the raw router logits for token $i$ and expert $j$.
+
+**Interpretation**: $\log \sum_j e^{x_j} = \text{logsumexp}(x)$ is the "soft maximum" of the logits. Squaring it and summing penalises large logit magnitudes directly — if all logits are small ($x_j \approx 0$), $\text{logsumexp} \approx \log E$, which is a constant. If any logit is large (e.g., $x_1 = 10$), $\text{logsumexp} \approx 10$ and the squared penalty is 100.
+
+**Mathematical consequence**: Minimising $\mathcal{L}_z$ prevents the router from learning to produce very confident single-expert assignments. The routing distribution stays more spread out, maintaining expert diversity and numerical stability.
+
+**Coefficient**: Literature suggests $\lambda_z \approx 10^{-3}$. Small enough to not override the detection loss, large enough to regularise logit magnitude.
+
+**Implementation in [moe.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/moe.py)** — add to `MoEDiagnostics` and compute before softmax:
+
+```python
+# Compute BEFORE softmax (need raw logits)
+router_logits = self.router(x_flat)                           # [N, E]
+z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean() # scalar
+
+probs = torch.softmax(router_logits, dim=-1)
+# ... rest unchanged
+```
+
+Add `router_z_loss: Tensor` field to `MoEDiagnostics` dataclass.
+
+---
+
+## 3.2 Stage-Specific Loss Compositions
+
+### Stage 1 Loss — Spatial Detector
+
+**What's training**: MotionCNN + CropEncoder + DetectionHead + MotionGate
+
+**Formula**:
+$$\mathcal{L}_{\text{Stage1}} = \underbrace{w_{hm} \cdot \mathcal{L}_{\text{HeatmapFocal}}}_{\text{1.0}} + \underbrace{w_{cls} \cdot \mathcal{L}_{\text{SigmoidFocal}}}_{\text{1.0}} + \underbrace{w_{box} \cdot \mathcal{L}_{\text{CIoU}}}_{\text{2.0}} + \underbrace{w_{motion} \cdot \mathcal{L}_{\text{motion}}}_{\text{0.5}} + \underbrace{w_{gate} \cdot \mathcal{L}_{\text{gate}}}_{\text{0.01}}$$
+
+| Term | Weight | Purpose |
+|---|---|---|
+| $\mathcal{L}_{\text{HeatmapFocal}}$ | 1.0 | Teach MotionCNN to produce clean peaked heatmaps |
+| $\mathcal{L}_{\text{SigmoidFocal}}$ | 1.0 | Teach DetectionHead to assign objectness; Focal prevents imbalance collapse |
+| $\mathcal{L}_{\text{CIoU}}$ | 2.0 | Teach DetectionHead to regress tight boxes; geometry-aware |
+| $\mathcal{L}_{\text{motion}}$ | 0.5 | Validate LDMI+MotionCNN captures motion direction and magnitude |
+| $\mathcal{L}_{\text{gate}} = \frac{1}{B}\sum(1 - g)$ | 0.01 | Sparsity: discourage gate from always triggering dense mode |
+
+**Requires**:
+- All frame targets in the clip (for $\mathcal{L}_{\text{motion}}$)
+- Heatmaps from all timesteps (for soft-argmax peak extraction)
+
+---
+
+### Stage 2 Loss — Temporal Fusion
+
+**What's training**: CausalTemporalFusion (MotionCNN, encoder, head, gate are frozen)
+
+**Formula**:
+$$\mathcal{L}_{\text{Stage2}} = \underbrace{w_{hm} \cdot \mathcal{L}_{\text{HeatmapFocal}}}_{\text{0.5}} + \underbrace{w_{cls} \cdot \mathcal{L}_{\text{SigmoidFocal}}}_{\text{1.0}} + \underbrace{w_{box} \cdot \mathcal{L}_{\text{CIoU}}}_{\text{2.0}} + \underbrace{w_{tc} \cdot \mathcal{L}_{\text{consist}}}_{\text{0.3}} + \underbrace{w_{sm} \cdot \mathcal{L}_{\text{smooth}}}_{\text{0.1}}$$
+
+| Term | Weight | Why this weight vs Stage 1 |
+|---|---|---|
+| $\mathcal{L}_{\text{HeatmapFocal}}$ | 0.5 | MotionCNN is frozen — this still propagates but is read-only signal |
+| $\mathcal{L}_{\text{SigmoidFocal}}$ | 1.0 | Detection must still work — same weight |
+| $\mathcal{L}_{\text{CIoU}}$ | 2.0 | Box accuracy — same weight |
+| $\mathcal{L}_{\text{consist}}$ | 0.3 | New: temporal consistency across frames |
+| $\mathcal{L}_{\text{smooth}}$ | 0.1 | New: trajectory smoothness on positive crops |
+
+**Note on heatmap loss in Stage 2**: MotionCNN is frozen, so $\mathcal{L}_{\text{HeatmapFocal}}$ won't update it. However the heatmap loss signal still informs the training loop logging and confirms spatial accuracy hasn't degraded. Weight reduced to 0.5 to keep it as a diagnostic signal without pulling gradient toward frozen layers.
+
+---
+
+### Stage 3 Loss — MoE Routing
+
+**What's training**: SparseMoE (everything else frozen)
+
+**Formula**:
+$$\mathcal{L}_{\text{Stage3}} = \underbrace{w_{cls} \cdot \mathcal{L}_{\text{SigmoidFocal}}}_{\text{1.0}} + \underbrace{w_{box} \cdot \mathcal{L}_{\text{CIoU}}}_{\text{2.0}} + \underbrace{w_{bal} \cdot \mathcal{L}_{\text{balance}}}_{\text{0.01}} + \underbrace{w_z \cdot \mathcal{L}_z}_{\text{0.001}}$$
+
+| Term | Weight | Purpose |
+|---|---|---|
+| $\mathcal{L}_{\text{SigmoidFocal}}$ | 1.0 | MoE must improve or maintain detection accuracy |
+| $\mathcal{L}_{\text{CIoU}}$ | 2.0 | MoE must improve or maintain box accuracy |
+| $\mathcal{L}_{\text{balance}}$ | 0.01 | Existing load-balancing: $E \sum f_j \bar{p}_j$ |
+| $\mathcal{L}_z$ | 0.001 | Router Z-Loss: prevent logit explosion, improve stability |
+
+**Why no heatmap loss in Stage 3**: Heatmap supervision targets MotionCNN which is frozen. Including it adds computation without useful gradient.
+
+**Why no temporal losses in Stage 3**: Temporal modules are frozen. These losses provide no useful gradient for the MoE.
+
+---
+
+### Stage 4 Loss — End-to-End Finetune
+
+**What's training**: Everything
+
+**Formula**:
+$$\mathcal{L}_{\text{Stage4}} = \underbrace{0.5 \cdot \mathcal{L}_{\text{HeatmapFocal}}}_{\text{spatial}} + \underbrace{1.0 \cdot \mathcal{L}_{\text{SigmoidFocal}}}_{\text{cls}} + \underbrace{2.0 \cdot \mathcal{L}_{\text{CIoU}}}_{\text{box}} + \underbrace{0.3 \cdot \mathcal{L}_{\text{motion}}}_{\text{motion}} + \underbrace{0.15 \cdot \mathcal{L}_{\text{consist}}}_{\text{temporal}} + \underbrace{0.05 \cdot \mathcal{L}_{\text{smooth}}}_{\text{smooth}} + \underbrace{0.01 \cdot \mathcal{L}_{\text{balance}}}_{\text{moe}} + \underbrace{0.001 \cdot \mathcal{L}_z}_{\text{z-loss}}$$
+
+Auxiliary weights ($\mathcal{L}_{\text{motion}}$, $\mathcal{L}_{\text{consist}}$, $\mathcal{L}_{\text{smooth}}$) are reduced from Stage 1/2 values. In the final joint finetuning, the **detection signal** ($\mathcal{L}_{\text{Focal}}$, $\mathcal{L}_{\text{CIoU}}$) must dominate. Auxiliary terms guide but should not overwhelm.
+
+---
+
+## 3.3 Complete File Change Map
+
+### NEW: [drishti_v2/training/focal_loss.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/focal_loss.py)
+
+```python
+"""Sigmoid Focal Loss and Heatmap Focal Loss implementations."""
+from __future__ import annotations
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+
+def sigmoid_focal_loss(logits: Tensor, targets: Tensor, gamma: float = 2.0, alpha: float = 0.25) -> Tensor:
     """
-    Applies consistent spatial augmentations across all frames of a video clip.
-    All transforms are applied identically to every frame in the temporal window
-    to preserve temporal consistency.
-    
-    Training augmentations:
-        - RandomHorizontalFlip(p=0.5)
-        - RandomColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05)
-        - RandomGaussianBlur(kernel_size=(3,3), sigma=(0.1, 2.0), p=0.2)
-        - RandomErasing(p=0.2, scale=(0.02, 0.1))   # simulate partial occlusion
-    
-    Inference augmentations:
-        - None (only normalize)
+    Sigmoid Focal Loss for binary classification.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Args:
+        logits: raw logits [*]
+        targets: binary labels in {0, 1} [*]
+        gamma: focusing parameter (default 2.0)
+        alpha: class balance weight for positives (default 0.25)
+
+    Returns:
+        scalar mean loss
     """
-    
-    def __init__(self, train: bool = True) -> None:
-        ...
-    
-    def __call__(
-        self,
-        frames: list[Tensor],     # list of [3, H, W] raw tensors
-        targets: list[dict],
-    ) -> tuple[list[Tensor], list[dict]]:
-        ...
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)       # p if y=1, 1-p if y=0
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    modulating = (1 - p_t).pow(gamma)
+    # Numerically stable BCE: max(logits,0) - logits*y + log(1+exp(-|logits|))
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    loss = alpha_t * modulating * bce
+    return loss.mean()
+
+
+def heatmap_focal_loss(pred: Tensor, gt: Tensor, alpha: float = 2.0, beta: float = 4.0) -> Tensor:
+    """
+    CornerNet/CenterNet Heatmap Focal Loss.
+
+    L = -(1/N) * sum_{xy} {
+        (1 - pred)^alpha * log(pred)               if gt == 1
+        (1 - gt)^beta * pred^alpha * log(1-pred)   otherwise
+    }
+
+    Args:
+        pred: predicted heatmap [B, 1, H, W] in (0, 1) — after Sigmoid
+        gt:   GT heatmap [B, 1, H, W] in [0, 1] — Gaussian blobs at object centers
+        alpha: focusing exponent (default 2.0)
+        beta:  background suppression exponent (default 4.0)
+
+    Returns:
+        scalar mean loss
+    """
+    pred = pred.clamp(1e-6, 1 - 1e-6)
+    pos_mask = (gt == 1.0).float()
+    neg_mask = 1.0 - pos_mask
+    n = pos_mask.sum().clamp_min(1)
+
+    pos_loss = (1 - pred).pow(alpha) * torch.log(pred) * pos_mask
+    neg_loss = (1 - gt).pow(beta) * pred.pow(alpha) * torch.log(1 - pred) * neg_mask
+
+    return -(pos_loss.sum() + neg_loss.sum()) / n
 ```
 
 ---
 
-## 5. Module-by-Module Implementation Blueprint
-
-### 5.1 `models/config.py` — `DRISHTIConfig`
+### NEW: [drishti_v2/training/ciou_loss.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/ciou_loss.py)
 
 ```python
-@dataclass
-class DRISHTIConfig:
+"""Complete IoU Loss for bounding box regression."""
+from __future__ import annotations
+import math
+import torch
+from torch import Tensor
+
+
+def ciou_loss(pred_boxes: Tensor, gt_boxes: Tensor, eps: float = 1e-7) -> Tensor:
     """
-    Master configuration for the DRISHTI-CORE v2 pipeline.
-    All hyperparameter values are listed here with their defaults and justification.
+    CIoU Loss = 1 - IoU + rho^2(b, b_gt)/c^2 + alpha_v * v
+    Operates on [cx, cy, w, h] normalised coordinates.
+
+    Args:
+        pred_boxes: [N, 4] predicted boxes in [cx, cy, w, h]
+        gt_boxes:   [N, 4] GT boxes in [cx, cy, w, h]
+
+    Returns:
+        scalar mean CIoU loss
     """
-    
-    # ─── Image Properties ────────────────────────────────────────────────────
-    image_channels: int = 3
-    image_height: int = 448
-    image_width: int = 448
-    
-    # ─── LDMI Parameters ─────────────────────────────────────────────────────
-    ldmi_scales: tuple[int, ...] = (15, 31)
-    # Justification: Scale 15 catches small drones (<10px); scale 31 catches
-    # medium drones (10-30px). Larger scales risk including target in the
-    # averaging window itself, reducing the residual signal.
-    
-    # ─── MotionCNN Parameters ────────────────────────────────────────────────
-    motion_cnn_channels: tuple[int, ...] = (32, 64, 64)
-    # Architecture: 9 -> 32 -> 64 -> 64 -> 1 with strides (2, 2, 1)
-    # Produces heatmap at H/4 x W/4 resolution (112x112 for 448 input)
-    
-    # ─── Crop Proposal Parameters ────────────────────────────────────────────
-    num_crops: int = 8
-    # MUST SATISFY: num_crops >= num_guided + num_edge + num_motion_min
-    
-    crop_size: int = 64             # pixels, square crop extracted from current frame
-    border_width_frac: float = 0.07 # fraction of frame width/height as edge zone
-    scan_period: int = 4            # Global interior scan every N frames
-    # Ablation target: sweep over scan_period ∈ {2, 4, 8, 16}
-    
-    # ─── Crop Encoder Parameters ─────────────────────────────────────────────
-    encoder_feature_dim: int = 256
-    encoder_frozen: bool = True     # Frozen during Stage 1 and 2 training
-    
-    # ─── Temporal Fusion Parameters ──────────────────────────────────────────
-    temporal_window: int = 5        # Number of past frames in context
-    temporal_heads: int = 4
-    temporal_layers: int = 2
-    temporal_ffn_dim: int = 512
-    temporal_dropout: float = 0.1
-    
-    # ─── MoE Parameters ──────────────────────────────────────────────────────
-    num_experts: int = 8
-    top_k: int = 2
-    expert_ffn_dim: int = 512
-    moe_dropout: float = 0.1
-    moe_balance_weight: float = 0.01   # Weight of auxiliary load-balance loss
-    
-    # ─── Detection Head Parameters ───────────────────────────────────────────
-    head_hidden_dim: int = 256
-    objectness_threshold: float = 0.3  # Inference confidence gate
-    
-    # ─── Tracker Parameters ──────────────────────────────────────────────────
-    tracker_dist_threshold: float = 0.15  # Normalized Euclidean distance gate
-    tracker_max_coast: int = 15           # Frames before track is deleted
-    tracker_birth_threshold: float = 0.3  # Min confidence for new track birth
+    # Convert to [x1, y1, x2, y2]
+    def to_xyxy(b):
+        return torch.stack([b[..., 0] - b[..., 2] / 2,
+                            b[..., 1] - b[..., 3] / 2,
+                            b[..., 0] + b[..., 2] / 2,
+                            b[..., 1] + b[..., 3] / 2], dim=-1)
+
+    p_xyxy = to_xyxy(pred_boxes)
+    g_xyxy = to_xyxy(gt_boxes)
+
+    # IoU
+    inter_x1 = torch.max(p_xyxy[..., 0], g_xyxy[..., 0])
+    inter_y1 = torch.max(p_xyxy[..., 1], g_xyxy[..., 1])
+    inter_x2 = torch.min(p_xyxy[..., 2], g_xyxy[..., 2])
+    inter_y2 = torch.min(p_xyxy[..., 3], g_xyxy[..., 3])
+    inter_w = (inter_x2 - inter_x1).clamp_min(0)
+    inter_h = (inter_y2 - inter_y1).clamp_min(0)
+    inter_area = inter_w * inter_h
+    pred_area = pred_boxes[..., 2] * pred_boxes[..., 3]
+    gt_area = gt_boxes[..., 2] * gt_boxes[..., 3]
+    union_area = pred_area + gt_area - inter_area + eps
+    iou = inter_area / union_area
+
+    # Enclosing box diagonal
+    enc_x1 = torch.min(p_xyxy[..., 0], g_xyxy[..., 0])
+    enc_y1 = torch.min(p_xyxy[..., 1], g_xyxy[..., 1])
+    enc_x2 = torch.max(p_xyxy[..., 2], g_xyxy[..., 2])
+    enc_y2 = torch.max(p_xyxy[..., 3], g_xyxy[..., 3])
+    c2 = (enc_x2 - enc_x1).pow(2) + (enc_y2 - enc_y1).pow(2) + eps
+
+    # Center distance
+    rho2 = (pred_boxes[..., 0] - gt_boxes[..., 0]).pow(2) + \
+           (pred_boxes[..., 1] - gt_boxes[..., 1]).pow(2)
+
+    # Aspect ratio
+    v = (4 / math.pi ** 2) * (
+        torch.atan(gt_boxes[..., 2] / gt_boxes[..., 3].clamp_min(eps)) -
+        torch.atan(pred_boxes[..., 2] / pred_boxes[..., 3].clamp_min(eps))
+    ).pow(2)
+    with torch.no_grad():
+        alpha_v = v / ((1 - iou) + v + eps)
+
+    loss = 1 - iou + rho2 / c2 + alpha_v * v
+    return loss.mean()
 ```
 
 ---
 
-### 5.2 `models/ldmi.py` — `LocalDifferentialMotion`
-
-**Class Purpose:** Non-learnable, parameter-free preprocessing module that computes camera-motion-invariant anomaly residuals.
+### NEW: [drishti_v2/training/motion_loss.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/motion_loss.py)
 
 ```python
-class LocalDifferentialMotion(nn.Module):
+"""Motion Displacement Loss — validates heatmap motion tracking."""
+from __future__ import annotations
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+
+def soft_argmax2d(heatmap: Tensor, temperature: float = 0.1) -> Tensor:
     """
-    Local Differential Motion Invariant (LDMI) Preprocessing Layer.
-    
-    Decouples target motion from camera ego-motion by computing the
-    per-pixel deviation from local spatial neighbourhood motion.
-    
-    Algorithm:
-        1. Compute frame differences: d_old = f_{t-1} - f_{t-2}
-                                      d_new = f_t - f_{t-1}
-        2. Average-pool each difference at multiple spatial scales
-           to estimate local uniform background motion.
-        3. Subtract pooled average from original difference to get residual:
-              r = |d - AvgPool(d, k)|
-        4. Fuse multi-scale residuals via element-wise max.
-        5. Return [r_old, f_t, r_new] — same shape as input triplet.
-    
-    Mathematical guarantee:
-        For any uniform translation vector v across the neighbourhood,
-        r = |v - avg(v, v, ..., v)| = |v - v| = 0
-        Therefore background motion always suppressed to 0.
-        Only pixels with non-local motion survive.
-    
-    Parameters:
-        image_channels (int): Number of channels per frame (default: 3)
-        scales (tuple[int, ...]): Average pooling kernel sizes (default: (15, 31))
-    
-    Learnable parameters: 0
-    FLOPs: ~2 * len(scales) * H * W * C avg_pool operations
+    Differentiable 2D argmax via softmax expectation.
+    Returns expected (x, y) position in normalised [0, 1] coords.
+
+    Args:
+        heatmap: [B, 1, H, W]
+        temperature: softmax temperature (lower = sharper, closer to hard argmax)
+
+    Returns:
+        [B, 2] expected positions (cx, cy) in [0, 1]
     """
-    
-    def __init__(
-        self,
-        image_channels: int = 3,
-        scales: tuple[int, ...] = (15, 31),
-    ) -> None:
-        super().__init__()
-        self.image_channels = image_channels
-        self.scales = scales
-        # No learnable parameters — registered as module for device tracking
-    
-    def _compute_residual(self, diff: Tensor) -> Tensor:
-        """
-        Compute the multi-scale local differential residual.
-        
-        Args:
-            diff: Frame difference tensor [B, C, H, W]
-        
-        Returns:
-            residual: Max-fused absolute residual [B, C, H, W]
-                      Values near 0 = background motion
-                      Values near 1 = anomalous motion (likely target)
-        """
-        residuals = []
-        for k in self.scales:
-            padding = k // 2
-            local_mean = F.avg_pool2d(
-                diff,
-                kernel_size=k,
-                stride=1,
-                padding=padding,
-                count_include_pad=False,
-            )
-            residuals.append(torch.abs(diff - local_mean))
-        
-        # Element-wise max across scales — captures all target size regimes
-        fused = residuals[0]
-        for r in residuals[1:]:
-            fused = torch.max(fused, r)
-        return fused
-    
-    def forward(self, triplet: Tensor) -> Tensor:
-        """
-        Args:
-            triplet: Causal frame triplet [B, C*3, H, W]
-                     channels 0:C   = f_{t-2}
-                     channels C:2C  = f_{t-1}
-                     channels 2C:3C = f_t
-        
-        Returns:
-            filtered: [B, C*3, H, W]
-                      channels 0:C   = residual r_{t-1}  (older anomaly)
-                      channels C:2C  = f_t               (raw appearance)
-                      channels 2C:3C = residual r_t      (recent anomaly)
-        
-        Note:
-            The raw f_t is preserved in the center channels so the
-            downstream MotionCNN has access to appearance context.
-            This prevents it from firing on motion artifacts alone.
-        """
-        C = self.image_channels
-        f_old  = triplet[:, 0:C]        # f_{t-2}
-        f_prev = triplet[:, C:2*C]      # f_{t-1}
-        f_curr = triplet[:, 2*C:3*C]    # f_t
-        
-        d_old = f_prev - f_old          # older motion
-        d_new = f_curr - f_prev         # recent motion
-        
-        r_old = self._compute_residual(d_old)
-        r_new = self._compute_residual(d_new)
-        
-        return torch.cat([r_old, f_curr, r_new], dim=1)
-```
+    B, _, H, W = heatmap.shape
+    flat = heatmap.view(B, -1) / temperature
+    weights = F.softmax(flat, dim=-1)
 
----
+    # Create coordinate grids
+    ys = torch.linspace(0, 1, H, device=heatmap.device)
+    xs = torch.linspace(0, 1, W, device=heatmap.device)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    grid_x = grid_x.reshape(1, -1).expand(B, -1)
+    grid_y = grid_y.reshape(1, -1).expand(B, -1)
 
-### 5.3 `models/motion_cnn.py` — `MotionCNN`
+    cx = (weights * grid_x).sum(dim=-1)
+    cy = (weights * grid_y).sum(dim=-1)
+    return torch.stack([cx, cy], dim=-1)   # [B, 2]
 
-**Class Purpose:** Learnable CNN that converts the LDMI-filtered triplet into a 2D spatial heatmap of anomalous motion.
 
-```python
-class MotionCNN(nn.Module):
+def motion_displacement_loss(
+    heatmaps: list[Tensor],
+    all_targets: list[list[dict]],
+    temperature: float = 0.1,
+) -> Tensor:
     """
-    Convolutional anomaly localizer.
-    
-    Takes the LDMI-filtered triplet and produces a single-channel heatmap
-    where high values indicate likely target presence.
-    
-    Architecture:
-        Input: [B, C*3, H, W]    (default 9 channels for RGB)
-        L1: Conv(9->32, k=3, s=2, p=1) + BN + ReLU  -> [B, 32, H/2, W/2]
-        L2: Conv(32->64, k=3, s=2, p=1) + BN + ReLU -> [B, 64, H/4, W/4]
-        L3: Conv(64->64, k=3, s=1, p=1) + BN + ReLU -> [B, 64, H/4, W/4]
-        L4: Conv(64->1, k=1, s=1, p=0) + Sigmoid    -> [B, 1, H/4, W/4]
-    
-    Training signal:
-        Supervised by a Gaussian heatmap centered on GT bounding boxes.
-        Loss: MSE between predicted heatmap and GT Gaussian heatmap.
-    
-    Parameters:
-        image_channels (int): Channels per frame (default: 3)
-        hidden_channels (tuple[int, ...]): Feature map sizes (default: (32, 64, 64))
+    L_motion = (1/(T-1)) * sum_t ||d_pred_t - d_gt_t||^2
+
+    Args:
+        heatmaps: list of T tensors, each [B, 1, H, W]
+        all_targets: list of B clips, each a list of T per-frame target dicts
+                     each dict has "boxes" key with [N, 4] GT boxes in [cx,cy,w,h]
+        temperature: soft-argmax temperature
+
+    Returns:
+        scalar loss
     """
-    
-    def __init__(
-        self,
-        image_channels: int = 3,
-        hidden_channels: tuple[int, ...] = (32, 64, 64),
-    ) -> None:
-        super().__init__()
-        in_channels = image_channels * 3  # triplet input
-        
-        layers = []
-        for idx, out_ch in enumerate(hidden_channels):
-            stride = 2 if idx < 2 else 1   # only first two layers downsample
-            layers += [
-                nn.Conv2d(in_channels, out_ch, kernel_size=3, stride=stride, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            ]
-            in_channels = out_ch
-        
-        # Final 1x1 projection to single channel
-        layers.append(nn.Conv2d(in_channels, 1, kernel_size=1, bias=True))
-        layers.append(nn.Sigmoid())
-        
-        self.net = nn.Sequential(*layers)
-    
-    def forward(self, filtered_triplet: Tensor) -> Tensor:
-        """
-        Args:
-            filtered_triplet: [B, C*3, H, W] — output of LocalDifferentialMotion
-        
-        Returns:
-            heatmap: [B, 1, H//4, W//4] — values in [0, 1]
-        """
-        return self.net(filtered_triplet)
-    
-    @staticmethod
-    def make_gt_heatmap(
-        boxes: Tensor,
-        heatmap_size: tuple[int, int],
-        sigma: float = 2.0,
-    ) -> Tensor:
-        """
-        Generates a Gaussian heatmap ground truth from bounding box annotations.
-        
-        Args:
-            boxes: Normalized [cx, cy, w, h] boxes [N, 4]
-            heatmap_size: (H_h, W_h) of the heatmap output
-            sigma: Gaussian spread (default: 2.0 heatmap pixels)
-        
-        Returns:
-            heatmap: [1, H_h, W_h] with values in [0, 1]
-        """
-        H_h, W_h = heatmap_size
-        heatmap = torch.zeros(1, H_h, W_h)
-        for box in boxes:
-            cx = int(box[0] * W_h)
-            cy = int(box[1] * H_h)
-            for y in range(H_h):
-                for x in range(W_h):
-                    heatmap[0, y, x] = max(
-                        heatmap[0, y, x],
-                        torch.exp(-((x - cx)**2 + (y - cy)**2) / (2 * sigma**2))
-                    )
-        return heatmap
-```
+    T = len(heatmaps)
+    if T < 2:
+        return heatmaps[0].sum() * 0.0
 
----
+    # Extract GT centers per frame [B, 2] — use first GT box center per frame
+    B = heatmaps[0].shape[0]
+    device = heatmaps[0].device
 
-### 5.4 `models/crop_proposal.py` — `CropProposalEngine`
-
-**Class Purpose:** The central scheduling and routing module. It decides WHERE to place the 8 crop windows every frame.
-
-```python
-@dataclass
-class ProposalOutput:
-    """All outputs from the crop proposal stage."""
-    crops: Tensor              # [B*K, C, crop_h, crop_w] — extracted image patches
-    centers: Tensor            # [B, K, 2] — normalized (x,y) centers
-    scores: Tensor             # [B, K] — heatmap value at each crop center
-    source_labels: Tensor      # [B, K] — 0=motion, 1=edge, 2=grid, 3=guided
-    heatmap: Tensor            # [B, 1, H_h, W_h] — full anomaly heatmap
-
-
-class CropProposalEngine(nn.Module):
-    """
-    Multi-Source Crop Attention Proposal Engine.
-    
-    Assembles exactly `num_crops` (default: 8) crop coordinates per frame
-    from four sources, ordered by priority:
-    
-      1. GUIDED   — coordinates predicted by the inference tracker (highest trust)
-      2. MOTION   — top-k peaks from the MotionCNN heatmap
-      3. EDGE     — boundary surveillance coordinates
-      4. GRID     — periodic interior sweep coordinates
-    
-    The priority ordering ensures that tracker feedback always gets slots first.
-    Remaining slots are filled by motion peaks, then edge positions, then grid.
-    
-    On training: tracker is absent, so allocation is MOTION + EDGE + GRID.
-    On inference: full allocation with guided coordinates from the tracker.
-    
-    Arguments:
-        config (DRISHTIConfig): Pipeline configuration object.
-    """
-    
-    def __init__(self, config: DRISHTIConfig) -> None:
-        super().__init__()
-        self.config = config
-        
-        # Pre-compute the static grid positions for interior sweep
-        # 2x2 grid covering the inner 60% of the frame
-        self._interior_grid = [
-            (0.30, 0.30), (0.30, 0.70),
-            (0.70, 0.30), (0.70, 0.70),
-        ]
-        
-        # Pre-compute edge midpoints for both alternating patterns
-        bw = config.border_width_frac
-        self._edge_horizontal = [(bw / 2, 0.5), (1 - bw / 2, 0.5)]   # Left, Right
-        self._edge_vertical   = [(0.5, bw / 2), (0.5, 1 - bw / 2)]   # Top, Bottom
-    
-    def _get_motion_centers(
-        self, heatmap: Tensor, n: int,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        Extract top-n peak coordinates from the heatmap using non-maximum suppression.
-        
-        Args:
-            heatmap: [B, 1, H_h, W_h]
-            n: Number of peaks to extract per batch item
-        
-        Returns:
-            centers: [B, n, 2] — normalized (x,y) coords in [0,1]
-            scores:  [B, n]    — heatmap confidence at each center
-        """
-        B, _, H_h, W_h = heatmap.shape
-        # Suppress non-maxima with max pooling trick
-        suppressed = F.max_pool2d(
-            heatmap, kernel_size=3, stride=1, padding=1
-        )
-        peaks = (heatmap == suppressed).float() * heatmap
-        flat = peaks.view(B, -1)
-        scores, indices = torch.topk(flat, k=n, dim=-1)
-        
-        row = (indices // W_h).float() / H_h
-        col = (indices % W_h).float() / W_h
-        centers = torch.stack([col, row], dim=-1)   # (x, y)
-        return centers, scores
-    
-    def _get_edge_centers(
-        self, frame_index: int, batch_size: int, device: torch.device,
-    ) -> Tensor:
-        """
-        Returns two border midpoint coordinates, alternating horizontal/vertical.
-        
-        Args:
-            frame_index: Global frame index to determine alternation
-            batch_size: B
-            device: Tensor device
-        
-        Returns:
-            centers: [B, 2, 2] — two (x,y) pairs per batch item
-        """
-        pattern = self._edge_horizontal if frame_index % 2 == 1 else self._edge_vertical
-        centers = torch.tensor(pattern, device=device)        # [2, 2]
-        return centers.unsqueeze(0).expand(batch_size, -1, -1)
-    
-    def _get_grid_centers(
-        self, batch_size: int, device: torch.device,
-    ) -> Tensor:
-        """
-        Returns the 4 static interior grid centers.
-        
-        Returns:
-            centers: [B, 4, 2]
-        """
-        centers = torch.tensor(self._interior_grid, device=device)   # [4, 2]
-        return centers.unsqueeze(0).expand(batch_size, -1, -1)
-    
-    def _extract_crops(
-        self, frame: Tensor, centers: Tensor,
-    ) -> Tensor:
-        """
-        Extract fixed-size patches from the current frame at given coordinates.
-        
-        Args:
-            frame: Current frame [B, C, H, W]
-            centers: [B, K, 2] normalized (x,y) centers
-        
-        Returns:
-            crops: [B*K, C, crop_h, crop_w]
-        """
-        B, C, H, W = frame.shape
-        K = centers.shape[1]
-        crop_h = crop_w = self.config.crop_size
-        
-        # Convert normalized to pixel coordinates
-        px = (centers[..., 0] * W).long()
-        py = (centers[..., 1] * H).long()
-        
-        crops = []
+    gt_centers = []
+    for t in range(T):
+        centers_t = []
         for b in range(B):
-            for k in range(K):
-                x0 = px[b, k] - crop_w // 2
-                y0 = py[b, k] - crop_h // 2
-                # Use replicate padding at boundaries
-                crop = F.pad(
-                    frame[b],
-                    pad=(
-                        max(0, -x0), max(0, x0 + crop_w - W),
-                        max(0, -y0), max(0, y0 + crop_h - H),
-                    ),
-                    mode="replicate",
-                )
-                x0c = max(x0, 0)
-                y0c = max(y0, 0)
-                crops.append(crop[:, y0c:y0c + crop_h, x0c:x0c + crop_w])
-        
-        return torch.stack(crops)
-    
-    def forward(
-        self,
-        frame: Tensor,
-        heatmap: Tensor,
-        frame_index: int,
-        guided_centers: Tensor | None = None,
-    ) -> ProposalOutput:
-        """
-        Assemble crop proposals from all four sources.
-        
-        Args:
-            frame: Current frame [B, C, H, W]
-            heatmap: MotionCNN output [B, 1, H_h, W_h]
-            frame_index: Global frame counter (for edge alternation + grid scheduling)
-            guided_centers: Optional [B, K_guided, 2] from tracker. None during training.
-        
-        Returns:
-            ProposalOutput with crops and metadata
-        """
-        B = frame.shape[0]
-        K = self.config.num_crops
-        device = frame.device
-        is_scan_frame = (frame_index % self.config.scan_period == 0)
-        
-        all_centers = []
-        all_scores = []
-        all_sources = []
-        
-        # 1. GUIDED CROPS (highest priority)
-        n_guided = 0
-        if guided_centers is not None:
-            n_guided = min(guided_centers.shape[1], K - 2)  # always reserve ≥2 for discovery
-            all_centers.append(guided_centers[:, :n_guided])
-            all_scores.append(torch.ones(B, n_guided, device=device))
-            all_sources.extend([3] * n_guided)  # 3 = guided
-        
-        remaining = K - n_guided
-        
-        # 2. GRID CROPS on scan frames
-        n_grid = 0
-        if is_scan_frame:
-            grid = self._get_grid_centers(B, device)
-            n_grid = min(4, remaining - 2)   # always reserve ≥2 for motion/edge
-            all_centers.append(grid[:, :n_grid])
-            all_scores.append(torch.zeros(B, n_grid, device=device))
-            all_sources.extend([2] * n_grid)  # 2 = grid
-        
-        remaining = K - n_guided - n_grid
-        
-        # 3. EDGE CROPS
-        edge = self._get_edge_centers(frame_index, B, device)   # [B, 2, 2]
-        n_edge = min(2, remaining - 1)   # always reserve ≥1 for motion
-        all_centers.append(edge[:, :n_edge])
-        all_scores.append(torch.zeros(B, n_edge, device=device))
-        all_sources.extend([1] * n_edge)   # 1 = edge
-        
-        remaining = K - n_guided - n_grid - n_edge
-        
-        # 4. MOTION CROPS (fill remainder from heatmap peaks)
-        if remaining > 0:
-            motion_centers, motion_scores = self._get_motion_centers(heatmap, remaining)
-            all_centers.append(motion_centers)
-            all_scores.append(motion_scores)
-            all_sources.extend([0] * remaining)  # 0 = motion
-        
-        # Assemble
-        centers = torch.cat(all_centers, dim=1)    # [B, K, 2]
-        scores  = torch.cat(all_scores, dim=1)     # [B, K]
-        source_labels = torch.tensor(all_sources, device=device).unsqueeze(0).expand(B, -1)
-        
-        # Extract image patches
-        crops = self._extract_crops(frame, centers)   # [B*K, C, crop_size, crop_size]
-        
-        return ProposalOutput(
-            crops=crops,
-            centers=centers,
-            scores=scores,
-            source_labels=source_labels,
-            heatmap=heatmap,
-        )
+            boxes = all_targets[b][t].get("boxes", torch.empty(0, 4))
+            if boxes.numel() > 0:
+                centers_t.append(boxes[0, :2].to(device))  # use first box center
+            else:
+                centers_t.append(torch.zeros(2, device=device))
+        gt_centers.append(torch.stack(centers_t, dim=0))   # [B, 2]
+
+    # Extract predicted heatmap peaks (soft argmax)
+    pred_peaks = [soft_argmax2d(hm, temperature) for hm in heatmaps]  # list of [B, 2]
+
+    total_loss = heatmaps[0].sum() * 0.0
+    for t in range(1, T):
+        d_pred = pred_peaks[t] - pred_peaks[t - 1]     # [B, 2]
+        d_gt = gt_centers[t] - gt_centers[t - 1]       # [B, 2]
+        total_loss = total_loss + (d_pred - d_gt).pow(2).sum(dim=-1).mean()
+
+    return total_loss / (T - 1)
 ```
 
 ---
 
-### 5.5 `models/crop_encoder.py` — `CropEncoder`
+### NEW: [drishti_v2/training/temporal_loss.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/temporal_loss.py)
 
 ```python
-class CropEncoder(nn.Module):
+"""Temporal Consistency Loss and Trajectory Smoothness Loss."""
+from __future__ import annotations
+import torch
+from torch import Tensor
+
+
+def temporal_consistency_loss(
+    logits_seq: list[Tensor],
+    centers_seq: list[Tensor],
+    sigma_spatial: float = 0.1,
+) -> Tensor:
     """
-    Visual feature extractor for 64x64 crop patches.
-    
-    Maps each crop to a fixed-dimensional feature vector.
-    Frozen during Stage 1 (Detector) and Stage 2 (Temporal) training.
-    
-    Architecture:
-        Conv(3->64,  k=3, s=1, p=1) + BN + ReLU  -> [64, 64, 64]
-        Conv(64->128, k=3, s=2, p=1) + BN + ReLU -> [128, 32, 32]
-        Conv(128->256,k=3, s=2, p=1) + BN + ReLU -> [256, 16, 16]
-        AdaptiveAvgPool2d(1)                       -> [256, 1, 1]
-        Flatten + Linear(256->256)                 -> [256]
-    
-    Parameters:
-        out_dim (int): Output feature dimension (default: 256)
-    
-    Learnable parameters: ~600K
+    L_consist = (1/K(T-1)) * sum_{k,t} w_{t,k} * (s_t^k - s_{t-1}^k)^2
+    Spatially-weighted score consistency across adjacent frames.
+
+    Args:
+        logits_seq: list of T tensors, each [B, K, 1] — objectness logits
+        centers_seq: list of T tensors, each [B, K, 2] — crop centers
+        sigma_spatial: spatial distance scale for weighting
+
+    Returns:
+        scalar loss
     """
-    
-    def __init__(self, out_dim: int = 256) -> None:
+    T = len(logits_seq)
+    if T < 2:
+        return logits_seq[0].sum() * 0.0
+
+    scores_seq = [torch.sigmoid(l.squeeze(-1)) for l in logits_seq]  # list of [B, K]
+    total = logits_seq[0].sum() * 0.0
+
+    for t in range(1, T):
+        # Spatial proximity weight
+        dist = (centers_seq[t] - centers_seq[t - 1]).pow(2).sum(dim=-1)  # [B, K]
+        w = torch.exp(-dist / (2 * sigma_spatial ** 2))
+
+        diff = (scores_seq[t] - scores_seq[t - 1]).pow(2)  # [B, K]
+        total = total + (w * diff).mean()
+
+    return total / (T - 1)
+
+
+def trajectory_smoothness_loss(
+    boxes_seq: list[Tensor],
+    labels_seq: list[Tensor],
+) -> Tensor:
+    """
+    L_smooth = (1/K_pos(T-2)) * sum_{pos k, t} ||Delta^2_t^k||^2
+
+    Args:
+        boxes_seq: list of T tensors, each [B, K, 4] — predicted boxes [cx,cy,w,h]
+        labels_seq: list of T tensors, each [B, K] — binary positive labels
+
+    Returns:
+        scalar loss
+    """
+    T = len(boxes_seq)
+    if T < 3:
+        return boxes_seq[0].sum() * 0.0
+
+    # Only apply to crops that are positive in at least one frame
+    pos_mask = torch.stack(labels_seq, dim=0).any(dim=0)  # [B, K]
+
+    total = boxes_seq[0].sum() * 0.0
+    count = 0
+
+    for t in range(2, T):
+        v_t = boxes_seq[t] - boxes_seq[t - 1]          # [B, K, 4] velocity
+        v_t1 = boxes_seq[t - 1] - boxes_seq[t - 2]     # [B, K, 4] prev velocity
+        acc = (v_t - v_t1).pow(2).sum(dim=-1)           # [B, K] acceleration magnitude
+
+        masked_acc = acc * pos_mask.float()
+        total = total + masked_acc.sum()
+        count += pos_mask.float().sum().item()
+
+    if count == 0:
+        return total
+    return total / max(count, 1)
+```
+
+---
+
+### NEW: [drishti_v2/training/stage_losses.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/stage_losses.py)
+
+```python
+"""Stage-specific loss functions for DRISHTI-CORE v2."""
+from __future__ import annotations
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
+
+from drishti_v2.models.motion_cnn import MotionCNN
+from drishti_v2.models.pipeline import PipelineOutput
+from drishti_v2.training.focal_loss import sigmoid_focal_loss, heatmap_focal_loss
+from drishti_v2.training.ciou_loss import ciou_loss
+from drishti_v2.training.motion_loss import motion_displacement_loss
+from drishti_v2.training.temporal_loss import temporal_consistency_loss, trajectory_smoothness_loss
+
+
+# ──────────────────────────────────────────────
+# Shared utility: crop-GT assignment
+# (Refactored from DRISHTILoss._assign_crops)
+# ──────────────────────────────────────────────
+
+def assign_crops(output: PipelineOutput, targets: list[dict]) -> tuple[Tensor, Tensor]:
+    """Assigns GT boxes to nearest crop centers. Returns labels and box targets."""
+    batch, num_crops, _ = output.proposal_centers.shape
+    labels = output.objectness_logits.new_zeros(batch, num_crops, 1)
+    box_targets = output.crop_boxes.detach().new_zeros(batch, num_crops, 4)
+    for b_idx, target in enumerate(targets):
+        boxes = target.get("boxes", torch.empty(0, 4)).to(output.proposal_centers.device)
+        if boxes.numel() == 0:
+            continue
+        centers = output.proposal_centers[b_idx]
+        distances = torch.cdist(centers, boxes[:, :2])
+        crop_indices = distances.argmin(dim=0).unique()
+        for crop_idx in crop_indices:
+            gt_idx = distances[crop_idx].argmin()
+            gt = boxes[gt_idx]
+            labels[b_idx, crop_idx, 0] = 1.0
+            global_pred_size = output.boxes[b_idx, crop_idx, 2:].clamp_min(1e-6)
+            crop_scale = global_pred_size / output.crop_boxes[b_idx, crop_idx, 2:].clamp_min(1e-6)
+            rel_xy = (gt[:2] - centers[crop_idx]) / crop_scale + 0.5
+            rel_wh = gt[2:] / crop_scale
+            box_targets[b_idx, crop_idx] = torch.cat([rel_xy, rel_wh]).clamp(0.0, 1.0)
+    return labels, box_targets
+
+
+def make_gt_heatmaps(targets: list[dict], heatmap_size: tuple[int, int], device: torch.device) -> Tensor:
+    """Build GT heatmaps from target dicts."""
+    return torch.stack([MotionCNN.make_gt_heatmap(
+        t.get("boxes", torch.empty(0, 4)).to(device), heatmap_size,
+    ) for t in targets], dim=0)
+
+
+# ──────────────────────────────────────────────
+# Stage 1: Spatial Detector
+# ──────────────────────────────────────────────
+
+class Stage1Loss(nn.Module):
+    def __init__(self, w_hm=1.0, w_cls=1.0, w_box=2.0, w_motion=0.5,
+                 w_gate=0.01, focal_gamma=2.0, focal_alpha=0.25,
+                 hm_alpha=2.0, hm_beta=4.0, motion_temperature=0.1):
         super().__init__()
-        self.frozen = False
-        
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.head = nn.Linear(256, out_dim)
-    
-    def forward(self, crops: Tensor) -> Tensor:
-        """
-        Args:
-            crops: [B*K, 3, 64, 64]
-        
-        Returns:
-            features: [B*K, out_dim]
-        """
-        x = self.backbone(crops).flatten(1)
-        return self.head(x)
-    
-    def freeze(self) -> None:
-        """Freeze all parameters. Called before Stage 1 training begins."""
-        for p in self.parameters():
-            p.requires_grad_(False)
-        self.frozen = True
-    
-    def unfreeze(self) -> None:
-        for p in self.parameters():
-            p.requires_grad_(True)
-        self.frozen = False
-```
+        self.w_hm, self.w_cls, self.w_box = w_hm, w_cls, w_box
+        self.w_motion, self.w_gate = w_motion, w_gate
+        self.gamma, self.alpha = focal_gamma, focal_alpha
+        self.hm_alpha, self.hm_beta = hm_alpha, hm_beta
+        self.motion_temp = motion_temperature
 
----
+    def forward(self, output: PipelineOutput, targets: list,
+                all_heatmaps: list[Tensor] | None = None) -> dict[str, Tensor]:
+        last_targets = [clip[-1] for clip in targets] if isinstance(targets[0], list) else targets
+        hm_size = tuple(output.heatmap.shape[-2:])
 
-### 5.6 `models/temporal_fusion.py` — `CausalTemporalFusion`
+        gt_hm = make_gt_heatmaps(last_targets, hm_size, output.heatmap.device).to(output.heatmap.dtype)
+        hm_loss = heatmap_focal_loss(output.heatmap, gt_hm, self.hm_alpha, self.hm_beta)
 
-```python
-class CausalTemporalFusion(nn.Module):
-    """
-    Causal Temporal Fusion Transformer.
-    
-    Fuses crop features across a past temporal window of length T=5.
-    Strictly causal — the model at time t only attends to {t-4,...,t}.
-    A causal attention mask is used during training to enforce this.
-    
-    Input format:
-        Feature sequence [B, T, K, D+1] where:
-            T = temporal window (5)
-            K = number of crops (8)
-            D = encoder feature dim (256)
-            +1 = scalar heatmap score appended to each crop's feature
-    
-    Processing:
-        1. Reshape to [B*K, T, D+1]  — treat each crop independently over time
-        2. Add learnable temporal positional embedding
-        3. Apply causal self-attention mask (lower-triangular)
-        4. Pass through 2 Transformer encoder blocks
-        5. Extract the last token (present timestep)
-        6. Project [D+1] -> [D]
-        7. Reshape back to [B, K, D]
-    
-    Why causal mask?
-        During training, the sequence is built from frames [t-T+1,...,t].
-        Without a causal mask, the transformer can attend to future frames
-        within the sequence. The mask prevents this, matching inference behaviour
-        where only past frames are available.
-    
-    Parameters:
-        feature_dim (int):   Crop encoder output dimension + 1 (default: 257)
-        out_dim (int):       Output feature dimension (default: 256)
-        nhead (int):         Attention heads (default: 4)
-        num_layers (int):    Transformer encoder depth (default: 2)
-        ffn_dim (int):       FFN inner width (default: 512)
-        dropout (float):     Attention and FFN dropout (default: 0.1)
-        max_seq_len (int):   Maximum temporal window (default: 5)
-    """
-    
-    def __init__(
-        self,
-        feature_dim: int = 257,
-        out_dim: int = 256,
-        nhead: int = 4,
-        num_layers: int = 2,
-        ffn_dim: int = 512,
-        dropout: float = 0.1,
-        max_seq_len: int = 5,
-    ) -> None:
+        labels, box_targets = assign_crops(output, last_targets)
+        cls_loss = sigmoid_focal_loss(output.objectness_logits, labels, self.gamma, self.alpha)
+
+        positive = labels.squeeze(-1) > 0.5
+        box_loss = ciou_loss(output.crop_boxes[positive], box_targets[positive]) \
+            if positive.any() else output.objectness_logits.sum() * 0.0
+
+        motion_loss = motion_displacement_loss(all_heatmaps, targets, self.motion_temp) \
+            if all_heatmaps is not None and isinstance(targets[0], list) \
+            else output.objectness_logits.sum() * 0.0
+
+        gate_loss = output.objectness_logits.sum() * 0.0  # placeholder — gate sparsity added in pipeline
+
+        total = (self.w_hm * hm_loss + self.w_cls * cls_loss +
+                 self.w_box * box_loss + self.w_motion * motion_loss +
+                 self.w_gate * gate_loss)
+
+        return {"loss": total, "heatmap": hm_loss, "cls": cls_loss,
+                "bbox": box_loss, "motion_disp": motion_loss,
+                "balance": output.balance_loss}
+
+
+# ──────────────────────────────────────────────
+# Stage 2: Temporal Fusion
+# ──────────────────────────────────────────────
+
+class Stage2Loss(nn.Module):
+    def __init__(self, w_hm=0.5, w_cls=1.0, w_box=2.0, w_tc=0.3, w_sm=0.1,
+                 focal_gamma=2.0, focal_alpha=0.25, hm_alpha=2.0, hm_beta=4.0):
         super().__init__()
-        
-        self.feature_dim = feature_dim
-        
-        # Learnable positional embedding for temporal positions
-        self.pos_embed = nn.Embedding(max_seq_len, feature_dim)
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=feature_dim,
-            nhead=nhead,
-            dim_feedforward=ffn_dim,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,   # Pre-norm for training stability
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Causal mask (cached)
-        self.register_buffer(
-            "_causal_mask",
-            nn.Transformer.generate_square_subsequent_mask(max_seq_len),
-        )
-        
-        self.proj = nn.Linear(feature_dim, out_dim)
-    
-    def forward(self, sequence: Tensor) -> Tensor:
-        """
-        Args:
-            sequence: [B, T, K, D+1] — temporal feature sequence
-        
-        Returns:
-            fused: [B, K, D] — features for the current timestep only
-        """
-        B, T, K, D = sequence.shape
-        
-        # Reshape: treat each crop as independent temporal sequence
-        x = sequence.permute(0, 2, 1, 3).reshape(B * K, T, D)  # [B*K, T, D]
-        
-        # Add temporal positional embeddings
-        positions = torch.arange(T, device=x.device)
-        x = x + self.pos_embed(positions).unsqueeze(0)
-        
-        # Causal self-attention
-        mask = self._causal_mask[:T, :T]
-        x = self.transformer(x, mask=mask)  # [B*K, T, D]
-        
-        # Extract present-timestep token and project
-        present = x[:, -1, :]              # [B*K, D]
-        out = self.proj(present)           # [B*K, out_dim]
-        
-        return out.reshape(B, K, -1)       # [B, K, out_dim]
-```
+        self.w_hm, self.w_cls, self.w_box = w_hm, w_cls, w_box
+        self.w_tc, self.w_sm = w_tc, w_sm
+        self.gamma, self.alpha = focal_gamma, focal_alpha
+        self.hm_alpha, self.hm_beta = hm_alpha, hm_beta
 
----
+    def forward(self, output: PipelineOutput, targets: list,
+                logits_seq: list[Tensor] | None = None,
+                centers_seq: list[Tensor] | None = None,
+                boxes_seq: list[Tensor] | None = None) -> dict[str, Tensor]:
+        last_targets = [clip[-1] for clip in targets] if isinstance(targets[0], list) else targets
+        hm_size = tuple(output.heatmap.shape[-2:])
 
-### 5.7 `models/moe.py` — `Expert` & `SparseMoE`
+        gt_hm = make_gt_heatmaps(last_targets, hm_size, output.heatmap.device).to(output.heatmap.dtype)
+        hm_loss = heatmap_focal_loss(output.heatmap, gt_hm, self.hm_alpha, self.hm_beta)
 
-```python
-class Expert(nn.Module):
-    """
-    Single FFN Expert module.
-    
-    Architecture: Linear(D->4D) -> GELU -> Dropout -> Linear(4D->D)
-    
-    Note: GELU is used instead of ReLU here because it provides
-    smoother gradients for the expert output, which stabilizes
-    routing diversity during early training.
-    """
-    
-    def __init__(self, d_model: int, ffn_dim: int, dropout: float = 0.1) -> None:
+        labels, box_targets = assign_crops(output, last_targets)
+        cls_loss = sigmoid_focal_loss(output.objectness_logits, labels, self.gamma, self.alpha)
+        positive = labels.squeeze(-1) > 0.5
+        box_loss = ciou_loss(output.crop_boxes[positive], box_targets[positive]) \
+            if positive.any() else output.objectness_logits.sum() * 0.0
+
+        tc_loss = temporal_consistency_loss(logits_seq, centers_seq) \
+            if logits_seq is not None and centers_seq is not None \
+            else output.objectness_logits.sum() * 0.0
+
+        labels_seq = [labels] * len(boxes_seq) if boxes_seq is not None else None
+        sm_loss = trajectory_smoothness_loss(boxes_seq, labels_seq) \
+            if boxes_seq is not None else output.objectness_logits.sum() * 0.0
+
+        total = (self.w_hm * hm_loss + self.w_cls * cls_loss + self.w_box * box_loss +
+                 self.w_tc * tc_loss + self.w_sm * sm_loss)
+        return {"loss": total, "heatmap": hm_loss, "cls": cls_loss, "bbox": box_loss,
+                "temporal_consist": tc_loss, "traj_smooth": sm_loss,
+                "balance": output.balance_loss}
+
+
+# ──────────────────────────────────────────────
+# Stage 3: MoE Routing
+# ──────────────────────────────────────────────
+
+class Stage3Loss(nn.Module):
+    def __init__(self, w_cls=1.0, w_box=2.0, w_bal=0.01, w_zloss=0.001,
+                 focal_gamma=2.0, focal_alpha=0.25):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, d_model),
-        )
-    
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
+        self.w_cls, self.w_box = w_cls, w_box
+        self.w_bal, self.w_zloss = w_bal, w_zloss
+        self.gamma, self.alpha = focal_gamma, focal_alpha
+
+    def forward(self, output: PipelineOutput, targets: list) -> dict[str, Tensor]:
+        last_targets = [clip[-1] for clip in targets] if isinstance(targets[0], list) else targets
+        labels, box_targets = assign_crops(output, last_targets)
+        cls_loss = sigmoid_focal_loss(output.objectness_logits, labels, self.gamma, self.alpha)
+        positive = labels.squeeze(-1) > 0.5
+        box_loss = ciou_loss(output.crop_boxes[positive], box_targets[positive]) \
+            if positive.any() else output.objectness_logits.sum() * 0.0
+        balance = output.balance_loss
+        z_loss = output.moe_diagnostics.router_z_loss if hasattr(output.moe_diagnostics, "router_z_loss") \
+            else output.balance_loss * 0.0
+
+        total = self.w_cls * cls_loss + self.w_box * box_loss + self.w_bal * balance + self.w_zloss * z_loss
+        return {"loss": total, "cls": cls_loss, "bbox": box_loss,
+                "balance": balance, "z_loss": z_loss}
 
 
-class SparseMoE(nn.Module):
-    """
-    Sparse Top-K Mixture-of-Experts with auxiliary load-balancing.
-    
-    Routes each input token to the top_k experts by learned routing probabilities.
-    Computes a weighted combination of their outputs.
-    
-    Auxiliary Loss (Switch Transformer formulation):
-        L_balance = n_experts * sum_e(f_e * p_e)
-        where:
-            f_e = fraction of tokens dispatched to expert e
-            p_e = mean routing probability assigned to expert e
-        
-        This penalises routing collapse (all tokens going to one expert)
-        by maximising routing entropy.
-    
-    Parameters:
-        d_model (int):      Input/output feature dimension (default: 256)
-        num_experts (int):  Total number of experts (default: 8)
-        top_k (int):        Number of experts activated per token (default: 2)
-        ffn_dim (int):      Expert FFN inner dimension (default: 512)
-        dropout (float):    Expert dropout (default: 0.1)
-    """
-    
-    def __init__(
-        self,
-        d_model: int = 256,
-        num_experts: int = 8,
-        top_k: int = 2,
-        ffn_dim: int = 512,
-        dropout: float = 0.1,
-    ) -> None:
+# ──────────────────────────────────────────────
+# Stage 4: End-to-End Finetune
+# ──────────────────────────────────────────────
+
+class Stage4Loss(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        
-        self.router = nn.Linear(d_model, num_experts, bias=False)
-        self.experts = nn.ModuleList([
-            Expert(d_model, ffn_dim, dropout)
-            for _ in range(num_experts)
-        ])
-    
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        """
-        Args:
-            x: [B, K, D] or [N, D]
-        
-        Returns:
-            out: Same shape as x — transformed features
-            balance_loss: Scalar auxiliary loss for load balancing
-        """
-        *dims, D = x.shape
-        x_flat = x.reshape(-1, D)   # [N, D]
-        N = x_flat.shape[0]
-        
-        # Routing probabilities
-        logits = self.router(x_flat)                        # [N, E]
-        probs = torch.softmax(logits, dim=-1)               # [N, E]
-        topk_probs, topk_indices = probs.topk(self.top_k, dim=-1)  # [N, k]
-        
-        # Normalize top-k weights to sum to 1
-        topk_weights = topk_probs / topk_probs.sum(dim=-1, keepdim=True)  # [N, k]
-        
-        # Compute outputs for each selected expert
-        out = torch.zeros_like(x_flat)
-        for rank in range(self.top_k):
-            expert_idx = topk_indices[:, rank]     # [N]
-            weights = topk_weights[:, rank]         # [N]
-            
-            for e in range(self.num_experts):
-                token_mask = (expert_idx == e)
-                if not token_mask.any():
-                    continue
-                expert_out = self.experts[e](x_flat[token_mask])   # [M, D]
-                out[token_mask] += weights[token_mask].unsqueeze(-1) * expert_out
-        
-        # Auxiliary load-balance loss
-        # f_e: fraction of tokens routed to expert e
-        f_e = torch.zeros(self.num_experts, device=x.device)
-        for e in range(self.num_experts):
-            f_e[e] = (topk_indices == e).float().mean()
-        
-        # p_e: mean routing probability for expert e
-        p_e = probs.mean(dim=0)   # [E]
-        
-        balance_loss = (self.num_experts * (f_e * p_e).sum())
-        
-        return out.reshape(*dims, D), balance_loss
+        self.s1 = Stage1Loss(w_motion=0.3, w_gate=0.01)
+        self.s2 = Stage2Loss(w_hm=0.5, w_tc=0.15, w_sm=0.05)
+        self.s3 = Stage3Loss(w_bal=0.01, w_zloss=0.001)
+
+    def forward(self, output: PipelineOutput, targets: list, **kwargs) -> dict[str, Tensor]:
+        d1 = self.s1.forward(output, targets, kwargs.get("all_heatmaps"))
+        d2 = self.s2.forward(output, targets, kwargs.get("logits_seq"),
+                              kwargs.get("centers_seq"), kwargs.get("boxes_seq"))
+        d3 = self.s3.forward(output, targets)
+        total = d1["loss"] + d2["temporal_consist"] + d2["traj_smooth"] + d3["z_loss"]
+        return {"loss": total, **{f"s1_{k}": v for k, v in d1.items()},
+                **{f"s2_{k}": v for k, v in d2.items()},
+                **{f"s3_{k}": v for k, v in d3.items()}}
+
+
+# ──────────────────────────────────────────────
+# Factory
+# ──────────────────────────────────────────────
+
+class StageLossFactory:
+    @staticmethod
+    def make_loss(stage: str, **kwargs) -> nn.Module:
+        stage = stage.lower()
+        if stage in {"stage1", "detector"}:
+            return Stage1Loss(**{k: v for k, v in kwargs.items()
+                                 if k in Stage1Loss.__init__.__code__.co_varnames})
+        if stage in {"stage2", "temporal"}:
+            return Stage2Loss(**{k: v for k, v in kwargs.items()
+                                 if k in Stage2Loss.__init__.__code__.co_varnames})
+        if stage in {"stage3", "moe"}:
+            return Stage3Loss(**{k: v for k, v in kwargs.items()
+                                 if k in Stage3Loss.__init__.__code__.co_varnames})
+        if stage in {"stage4", "finetune", "e2e", "all"}:
+            return Stage4Loss()
+        raise ValueError(f"Unknown stage: {stage}")
 ```
 
 ---
 
-### 5.8 `models/detection_head.py` — `DetectionHead`
+### MODIFY: [drishti_v2/models/moe.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/moe.py)
+
+Add `router_z_loss` field to `MoEDiagnostics` (line 25):
+
+```diff
+ @dataclass
+ class MoEDiagnostics:
+     balance_loss: Tensor
+     expert_utilization: Tensor
+     routing_probabilities: Tensor
+     router_entropy: Tensor
+     token_drop_rate: Tensor
+     expert_reuse_frequency: Tensor
+     load_balance_cv: Tensor
++    router_z_loss: Tensor           # NEW: logsumexp squared penalty
+```
+
+In `SparseMoE.forward` (after line 68, before `probs = softmax(...)`):
+
+```diff
++    # Router Z-Loss (computed on raw logits, before softmax)
++    router_logits = self.router(x_flat)                              # [N, E]
++    z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()   # scalar
+-    probs = torch.softmax(self.router(x_flat), dim=-1)
++    probs = torch.softmax(router_logits, dim=-1)
+```
+
+Pass `router_z_loss=z_loss.detach()` to `MoEDiagnostics` in both the dense and sparse branches.
+
+---
+
+### MODIFY: [drishti_v2/training/losses.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/losses.py)
+
+Add deprecation warning at top of `DRISHTILoss.__init__`:
+
+```diff
++import warnings
+ class DRISHTILoss(nn.Module):
+     def __init__(self, ...):
++        warnings.warn(
++            "DRISHTILoss is deprecated. Use StageLossFactory.make_loss(stage) instead.",
++            DeprecationWarning, stacklevel=2,
++        )
+         super().__init__()
+         ...
+```
+
+---
+
+### MODIFY: [drishti_v2/training/trainer.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/trainer.py)
+
+Key changes:
+
+1. **Line 87** — change type hint from `DRISHTILoss` to `nn.Module`:
+```diff
+-    loss_fn: DRISHTILoss,
++    loss_fn: nn.Module,
+```
+
+2. **Line 205** — extend accumulator for new loss keys:
+```diff
+-    accum = {"loss": 0.0, "heatmap": 0.0, "cls": 0.0, "bbox": 0.0, "balance": 0.0}
++    accum = {k: 0.0 for k in [
++        "loss", "heatmap", "cls", "bbox", "balance",
++        "motion_disp", "temporal_consist", "traj_smooth", "z_loss",
++    ]}
+```
+
+3. **Line 227** — pass stage-appropriate extras to loss:
+```diff
+-    losses = self.loss_fn(output, batch["targets"])
++    loss_kwargs = {"targets": batch["targets"]}
++    if stage in {"stage1", "detector", "stage4", "finetune", "e2e", "all"}:
++        loss_kwargs["all_heatmaps"] = getattr(output, "_all_heatmaps", None)
++    losses = self.loss_fn(output, **loss_kwargs)
+```
+
+4. **Lines 264–269** — extend per-step JSONL log to include new keys:
+```diff
+     "loss/total": round(float(losses["loss"].detach().cpu()), 6),
+     "loss/heatmap": round(float(losses.get("heatmap", losses["loss"]*0).detach().cpu()), 6),
+     "loss/cls": round(float(losses.get("cls", losses["loss"]*0).detach().cpu()), 6),
+     "loss/bbox": round(float(losses.get("bbox", losses["loss"]*0).detach().cpu()), 6),
+     "loss/balance": round(float(losses.get("balance", losses["loss"]*0).detach().cpu()), 6),
++    "loss/motion_disp": round(float(losses.get("motion_disp", losses["loss"]*0).detach().cpu()), 6),
++    "loss/temporal_consist": round(float(losses.get("temporal_consist", losses["loss"]*0).detach().cpu()), 6),
++    "loss/traj_smooth": round(float(losses.get("traj_smooth", losses["loss"]*0).detach().cpu()), 6),
++    "loss/z_loss": round(float(losses.get("z_loss", losses["loss"]*0).detach().cpu()), 6),
+```
+
+---
+
+### MODIFY: [drishti_v2/evaluation/metrics.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/evaluation/metrics.py)
+
+Add new metric functions after line 90:
 
 ```python
-class DetectionHead(nn.Module):
+def heatmap_peak_metrics(
+    heatmaps: list[Tensor],          # [B, 1, H, W] per batch
+    targets: list[dict[str, Tensor]],
+    pixel_threshold_frac: float = 5.0 / 448,
+) -> dict[str, float]:
     """
-    Detection head that maps per-crop features to object predictions.
-    
-    For each crop, independently predicts:
-        - objectness: probability this crop contains a target (scalar)
-        - box:        bounding box [cx, cy, w, h] relative to crop boundaries
-                      normalized to [0,1] in crop-space
-    
-    Architecture:
-        Objectness branch:
-            LayerNorm -> Linear(D->1)  (no activation; BCEWithLogitsLoss)
-        
-        Box regression branch:
-            LayerNorm -> Linear(D->D) -> GELU -> Linear(D->4) -> Sigmoid
-    
-    Why separate branches?
-        Objectness and box regression have very different gradient magnitudes.
-        Shared weights would cause the dominant task (objectness) to suppress
-        the box regression signals.
-    
-    Why Sigmoid for box?
-        Forces outputs to [0,1] = valid normalized crop-space coordinates.
+    - heatmap_peak_distance: mean L2 distance between heatmap peak and GT center
+    - heatmap_peak_within_threshold: fraction of frames where peak is within threshold distance
     """
-    
-    def __init__(self, feature_dim: int = 256) -> None:
-        super().__init__()
-        
-        self.objectness_head = nn.Sequential(
-            nn.LayerNorm(feature_dim),
-            nn.Linear(feature_dim, 1),
-        )
-        
-        self.box_head = nn.Sequential(
-            nn.LayerNorm(feature_dim),
-            nn.Linear(feature_dim, feature_dim),
-            nn.GELU(),
-            nn.Linear(feature_dim, 4),
-            nn.Sigmoid(),
-        )
-    
-    def forward(self, features: Tensor) -> tuple[Tensor, Tensor]:
-        """
-        Args:
-            features: [B, K, D]
-        
-        Returns:
-            objectness_logits: [B, K, 1]  — raw (pre-sigmoid) objectness scores
-            boxes: [B, K, 4]              — normalized [cx, cy, w, h] in crop-space
-        """
-        return self.objectness_head(features), self.box_head(features)
+    distances = []
+    within = []
+    for hm, target in zip(heatmaps, targets):
+        boxes = target.get("boxes", torch.empty(0, 4))
+        if boxes.numel() == 0:
+            continue
+        gt_center = boxes[0, :2]  # use first GT box
+        # Hard argmax for evaluation (not training)
+        H, W = hm.shape[-2:]
+        flat_idx = hm.view(-1).argmax()
+        cy = (flat_idx // W).float() / H
+        cx = (flat_idx % W).float() / W
+        pred_center = torch.tensor([cx, cy])
+        dist = (pred_center - gt_center.cpu()).pow(2).sum().sqrt().item()
+        distances.append(dist)
+        within.append(float(dist < pixel_threshold_frac))
+    return {
+        "heatmap_peak_distance": float(sum(distances) / max(len(distances), 1)),
+        "heatmap_peak_within_5px": float(sum(within) / max(len(within), 1)),
+    }
+
+
+def motion_direction_accuracy(
+    pred_displacements: list[Tensor],   # list of [2] vectors
+    gt_displacements: list[Tensor],
+) -> dict[str, float]:
+    """Cosine similarity between predicted and GT motion direction vectors."""
+    sims = []
+    for pd, gd in zip(pred_displacements, gt_displacements):
+        cos_sim = F.cosine_similarity(pd.unsqueeze(0), gd.unsqueeze(0)).item()
+        sims.append(cos_sim)
+    return {"motion_direction_accuracy": float(sum(sims) / max(len(sims), 1))}
 ```
 
 ---
 
-### 5.9 `models/pipeline.py` — `DRISHTIPipeline`
+### MODIFY: [configs/default.yaml](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/configs/default.yaml)
 
-```python
-@dataclass
-class PipelineOutput:
-    heatmap: Tensor              # [B, 1, H_h, W_h]
-    proposal_centers: Tensor     # [B, K, 2]
-    proposal_scores: Tensor      # [B, K]
-    proposal_sources: Tensor     # [B, K]  source label per crop
-    crop_features: Tensor        # [B, K, D]
-    fused_features: Tensor       # [B, K, D]
-    moe_features: Tensor         # [B, K, D]
-    objectness_logits: Tensor    # [B, K, 1]
-    boxes: Tensor                # [B, K, 4]
-    balance_loss: Tensor         # scalar
-
-
-class DRISHTIPipeline(nn.Module):
-    """
-    Full DRISHTI-CORE v2 Pipeline (training mode).
-    
-    Assembles all modules in sequence. Maintains a rolling temporal buffer
-    to provide the causal temporal fusion stage with past feature context.
-    
-    Call forward() for training (causal temporal window over clip).
-    Call forward_stream() for real-time inference frame-by-frame.
-    """
-    
-    def __init__(self, config: DRISHTIConfig) -> None:
-        super().__init__()
-        self.config = config
-        
-        self.ldmi         = LocalDifferentialMotion(config.image_channels, config.ldmi_scales)
-        self.motion_cnn   = MotionCNN(config.image_channels, config.motion_cnn_channels)
-        self.crop_engine  = CropProposalEngine(config)
-        self.encoder      = CropEncoder(config.encoder_feature_dim)
-        self.temporal     = CausalTemporalFusion(
-            feature_dim=config.encoder_feature_dim + 1,  # +1 for score
-            out_dim=config.encoder_feature_dim,
-            nhead=config.temporal_heads,
-            num_layers=config.temporal_layers,
-            ffn_dim=config.temporal_ffn_dim,
-            dropout=config.temporal_dropout,
-            max_seq_len=config.temporal_window,
-        )
-        self.moe          = SparseMoE(
-            d_model=config.encoder_feature_dim,
-            num_experts=config.num_experts,
-            top_k=config.top_k,
-            ffn_dim=config.expert_ffn_dim,
-            dropout=config.moe_dropout,
-        )
-        self.head         = DetectionHead(config.encoder_feature_dim)
-        
-        # Rolling feature buffer for temporal fusion
-        # Maintained as a deque of [B, K, D+1] tensors
-        self._feature_buffer: list[Tensor] = []
-    
-    def forward(
-        self,
-        frames: Tensor,               # [B, T, C, H, W] — full clip
-        frame_index: int = 0,
-        guided_centers: Tensor | None = None,
-    ) -> PipelineOutput:
-        """Training forward pass over a full temporal clip."""
-        B, T, C, H, W = frames.shape
-        
-        # Build temporal feature sequence
-        all_features = []
-        last_heatmap = None
-        last_centers = None
-        last_scores = None
-        last_sources = None
-        last_logits = None
-        last_boxes = None
-        
-        for t in range(T):
-            # Step 1: Build causal triplet [t-2, t-1, t]
-            t0 = max(0, t - 2)
-            t1 = max(0, t - 1)
-            triplet = torch.cat([frames[:, t0], frames[:, t1], frames[:, t]], dim=1)
-            
-            # Step 2: LDMI filter
-            filtered = self.ldmi(triplet)
-            
-            # Step 3: Generate heatmap
-            heatmap = self.motion_cnn(filtered)
-            
-            # Step 4: Crop proposals
-            proposal = self.crop_engine(
-                frame=frames[:, t],
-                heatmap=heatmap,
-                frame_index=frame_index + t,
-                guided_centers=guided_centers if t == T - 1 else None,
-            )
-            
-            # Step 5: Encode crops
-            encoded = self.encoder(proposal.crops)        # [B*K, D]
-            encoded = encoded.reshape(B, self.config.num_crops, -1)  # [B, K, D]
-            
-            # Append motion scores to features
-            scores = proposal.scores.unsqueeze(-1)        # [B, K, 1]
-            augmented = torch.cat([encoded, scores], dim=-1)  # [B, K, D+1]
-            all_features.append(augmented)
-            
-            last_heatmap = heatmap
-            last_centers = proposal.centers
-            last_scores = proposal.scores
-            last_sources = proposal.source_labels
-        
-        # Step 6: Temporal fusion on the last T frames
-        sequence = torch.stack(all_features, dim=1)   # [B, T, K, D+1]
-        fused = self.temporal(sequence)               # [B, K, D]
-        
-        # Step 7: Sparse MoE
-        moe_out, balance_loss = self.moe(fused)       # [B, K, D]
-        
-        # Step 8: Detection head
-        logits, boxes = self.head(moe_out)            # logits: [B,K,1], boxes: [B,K,4]
-        
-        return PipelineOutput(
-            heatmap=last_heatmap,
-            proposal_centers=last_centers,
-            proposal_scores=last_scores,
-            proposal_sources=last_sources,
-            crop_features=encoded,
-            fused_features=fused,
-            moe_features=moe_out,
-            objectness_logits=logits,
-            boxes=boxes,
-            balance_loss=balance_loss,
-        )
-```
-
----
-
-### 5.10 `tracker/tracker.py` — `Track` & `SimpleTracker`
-
-```python
-@dataclass
-class Track:
-    """Single target track state."""
-    track_id: int
-    center: Tensor       # [2] normalized (x,y)
-    size: Tensor         # [2] normalized (w,h)
-    velocity: Tensor     # [2] in normalized units/frame
-    confidence: float
-    age: int = 0
-    coast_count: int = 0
-    hit_count: int = 1
-
-
-class SimpleTracker:
-    """
-    Inference-time multi-target state tracker.
-    
-    Maintains a list of Track objects across frames.
-    Associates incoming detections to tracks using Euclidean distance gating.
-    
-    Track Lifecycle:
-        BIRTH   -> confidence > birth_threshold, no matching track found
-        ACTIVE  -> confirmed after hit_count >= 1 (simplified; could require 3 in stricter mode)
-        COAST   -> no matching detection within dist_threshold; keep predicting
-        DEAD    -> coast_count > max_coast; removed from table
-    
-    Output:
-        get_guided_centers() returns the predicted center for each active
-        track at time t+1, which are fed into CropProposalEngine as guided crops.
-    """
-    
-    def __init__(
-        self,
-        dist_threshold: float = 0.15,
-        max_coast: int = 15,
-        birth_threshold: float = 0.3,
-    ) -> None:
-        self.dist_threshold = dist_threshold
-        self.max_coast = max_coast
-        self.birth_threshold = birth_threshold
-        self.tracks: list[Track] = []
-        self._next_id = 0
-    
-    def predict(self) -> None:
-        """
-        Constant-velocity state projection.
-        Called BEFORE processing detections for the current frame.
-        """
-        for track in self.tracks:
-            track.center = (track.center + track.velocity).clamp(0.0, 1.0)
-            track.coast_count += 1
-            track.age += 1
-    
-    def update(self, boxes: Tensor, logits: Tensor) -> None:
-        """
-        Associate detections to tracks and update state.
-        
-        Args:
-            boxes: [K, 4] normalized [cx, cy, w, h] from detection head
-            logits: [K, 1] objectness logits
-        """
-        confs = torch.sigmoid(logits.squeeze(-1))    # [K]
-        high_conf_mask = confs > self.birth_threshold
-        det_boxes = boxes[high_conf_mask]
-        det_confs = confs[high_conf_mask]
-        
-        matched_det = set()
-        matched_track = set()
-        
-        # Greedy distance matching
-        for t_idx, track in enumerate(self.tracks):
-            best_dist = float("inf")
-            best_d_idx = -1
-            for d_idx, det in enumerate(det_boxes):
-                if d_idx in matched_det:
-                    continue
-                dist = torch.norm(track.center - det[:2]).item()
-                if dist < best_dist:
-                    best_dist = dist
-                    best_d_idx = d_idx
-            
-            if best_dist < self.dist_threshold and best_d_idx >= 0:
-                # Update matched track
-                new_center = det_boxes[best_d_idx, :2]
-                track.velocity = new_center - track.center
-                track.center = new_center
-                track.size = det_boxes[best_d_idx, 2:]
-                track.confidence = det_confs[best_d_idx].item()
-                track.coast_count = 0
-                track.hit_count += 1
-                matched_det.add(best_d_idx)
-                matched_track.add(t_idx)
-        
-        # Prune dead tracks
-        self.tracks = [t for t in self.tracks if t.coast_count <= self.max_coast]
-        
-        # Birth new tracks from unmatched detections
-        for d_idx, det in enumerate(det_boxes):
-            if d_idx not in matched_det:
-                self.tracks.append(Track(
-                    track_id=self._next_id,
-                    center=det[:2].clone(),
-                    size=det[2:].clone(),
-                    velocity=torch.zeros(2),
-                    confidence=det_confs[d_idx].item(),
-                ))
-                self._next_id += 1
-    
-    def get_guided_centers(self) -> Tensor | None:
-        """
-        Returns predicted positions of all active tracks.
-        
-        Returns:
-            centers: [1, N_tracks, 2] or None if no tracks
-        """
-        if not self.tracks:
-            return None
-        centers = torch.stack([t.center for t in self.tracks]).unsqueeze(0)
-        return centers
-    
-    def reset(self) -> None:
-        """Clear all tracks (e.g., between evaluation sequences)."""
-        self.tracks = []
-        self._next_id = 0
-```
-
----
-
-## 6. Loss Functions
-
-All losses live in `training/losses.py`.
-
-```python
-class DRISHTILoss(nn.Module):
-    """
-    Combined multi-task loss for DRISHTI-CORE v2.
-    
-    Components:
-        L_heatmap:  MSE between predicted heatmap and GT Gaussian heatmap.
-                    Supervision signal for the MotionCNN to localize targets.
-        
-        L_cls:      Binary Cross Entropy with Logits between predicted
-                    objectness and per-crop binary assignment from GT boxes.
-                    Positive: crop whose center is nearest to any GT box center.
-                    Negative: all other crops.
-        
-        L_bbox:     Smooth L1 Loss between predicted box offsets and GT offsets,
-                    computed ONLY on positive crops (L_cls label = 1).
-                    Using Smooth L1 rather than L1 for robustness to outlier predictions
-                    in early training.
-        
-        L_balance:  MoE auxiliary load-balancing loss (from SparseMoE.forward()).
-                    Prevents routing collapse.
-    
-    Total Loss:
-        L = w_h * L_heatmap + w_c * L_cls + w_b * L_bbox + w_m * L_balance
-    
-    Default weights (from procedure.md):
-        w_h = 1.0, w_c = 1.0, w_b = 2.0, w_m = 0.01
-    
-    Why these weights?
-        L_bbox gets 2x because small coordinate errors in tiny targets have
-        large IoU impact. The box regression task needs stronger signal.
-        L_balance gets 0.01 because it is an auxiliary regularizer — too high
-        would force uniform routing even when specialization is beneficial.
-    """
-    
-    def __init__(
-        self,
-        w_heatmap: float = 1.0,
-        w_cls: float = 1.0,
-        w_bbox: float = 2.0,
-        w_balance: float = 0.01,
-    ) -> None:
-        ...
-    
-    def forward(
-        self,
-        output: PipelineOutput,
-        targets: list[dict],            # list of [B] per-frame GT dicts
-        heatmap_size: tuple[int, int],
-    ) -> dict[str, Tensor]:
-        """
-        Returns:
-            {
-                "loss": total weighted loss (scalar, differentiable)
-                "heatmap": L_heatmap
-                "cls": L_cls
-                "bbox": L_bbox
-                "balance": L_balance
-            }
-        """
-        ...
-```
-
----
-
-## 7. Activation Functions
-
-| Location | Activation | Reason |
-|---|---|---|
-| MotionCNN (hidden layers) | ReLU | Standard; inlcuded with BN for training stability |
-| MotionCNN (output) | Sigmoid | Forces output to [0,1] — needed for MSE heatmap loss supervision |
-| CropEncoder (hidden) | ReLU | Standard; paired with BatchNorm |
-| CausalTemporalFusion (FFN) | ReLU (via PyTorch default TransformerEncoderLayer) | Standard transformer practice |
-| Expert FFN | GELU | Smoother gradients → better routing diversity than ReLU in MoE |
-| DetectionHead (objectness) | None (logit) | BCEWithLogitsLoss absorbs sigmoid numerically stably |
-| DetectionHead (box) | Sigmoid | Forces box coordinates to [0,1] — valid normalized space |
-
----
-
-## 8. Hyperparameter Specification & Justification
-
-| Hyperparameter | Default Value | Ablation Range | Justification |
-|---|---|---|---|
-| `image_size` | 448×448 | fixed | Anti-UAV standard; large enough for tiny target resolution |
-| `temporal_window` | 5 | {3, 5, 7} | 5 frames ≈ 0.2 sec @25fps. Enough for velocity estimation without excessive memory |
-| `num_crops` | 8 | {4, 8, 16} | **Must be ablated.** 8 balances coverage and compute. |
-| `crop_size` | 64 | {32, 64, 128} | 64 × 64 is 1/7 of image width — large enough for tiny target |
-| `scan_period` | 4 | {2, 4, 8, 16} | **Must be ablated.** Every 4th frame = 6.25% compute overhead |
-| `border_width_frac` | 0.07 | {0.05, 0.07, 0.10} | 7% ≈ 31px of 448px — sufficient zone for boundary detection |
-| `ldmi_scales` | (15, 31) | {(15,), (31,), (15,31), (15,31,63)} | Two scales cover <10px and <30px targets. 63 captures larger objects |
-| `num_experts` | 8 | {4, 8, 16} | Matches num_crops — one potential expert specialization per crop source |
-| `top_k` | 2 | {1, 2, 4} | Top-2 → 25% active parameters. Top-1 collapses; top-4 reduces savings |
-| `encoder_feature_dim` | 256 | fixed | Standard intermediate dimension; sufficient for small dataset scale |
-| `temporal_heads` | 4 | {2, 4, 8} | 4 heads for 257-dim = 64-dim per head — efficient |
-| `temporal_layers` | 2 | {1, 2, 4} | Shallow is intentional — this is a refinement stage, not a backbone |
-| `moe_balance_weight` | 0.01 | {0.001, 0.01, 0.1} | Standard Switch Transformer value |
-| `objectness_threshold` | 0.3 | {0.2, 0.3, 0.5} | Tuned on val set; lower → more recall, higher → more precision |
-| `tracker_dist_threshold` | 0.15 | {0.05, 0.10, 0.15} | 0.15 = 67px at 448 resolution; large enough for typical UAV velocity |
-| `tracker_max_coast` | 15 | {5, 10, 15, 25} | 15 frames = 0.6s @25fps; minimum time behind a building edge |
-
----
-
-## 9. Staged Training Procedure
-
-### Stage 1: Detector Pre-training
-```
-Trainable:   MotionCNN, DetectionHead
-Frozen:      CropEncoder, TemporalFusion, MoE
-Loss:        L_heatmap + L_cls + L_bbox  (no balance loss — MoE frozen)
-Optimizer:   AdamW(lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.999))
-Scheduler:   CosineAnnealingLR(T_max=80, eta_min=1e-6)
-Epochs:      80
-Batch Size:  16 clips
-Input:       Single-frame triplet (temporal window = 1, no temporal fusion)
-Notes:       TemporalFusion receives a single padded sequence of identical features.
-             This teaches the MotionCNN and head to detect from pure spatial evidence.
-Output:      checkpoints/stage1_best.pt
-```
-
-### Stage 2: Temporal Integration
-```
-Trainable:   CausalTemporalFusion
-Frozen:      MotionCNN, CropEncoder, MoE, DetectionHead
-Loss:        L_cls + L_bbox  (heatmap supervision no longer needed here)
-Optimizer:   AdamW(lr=5e-5, weight_decay=1e-4)
-Scheduler:   CosineAnnealingLR(T_max=30, eta_min=1e-7)
-Epochs:      30
-Batch Size:  8 clips (T=5, higher memory)
-Init:        Load checkpoints/stage1_best.pt
-Notes:       The stage-1 detector provides stable, high-quality crop encodings.
-             The transformer can now learn WHEN a crop is interesting over time.
-Output:      checkpoints/stage2_best.pt
-```
-
-### Stage 3: MoE Specialization
-```
-Trainable:   SparseMoE (router + experts)
-Frozen:      Everything else
-Loss:        L_cls + L_bbox + w_m * L_balance
-Optimizer:   AdamW(lr=1e-5, weight_decay=1e-4)
-Scheduler:   CosineAnnealingLR(T_max=20, eta_min=1e-8)
-Epochs:      20
-Batch Size:  8 clips
-Init:        Load checkpoints/stage2_best.pt
-Notes:       Low LR because we are fine-tuning a single routing module.
-             Monitor expert utilization (each expert should receive >5% of tokens).
-             If routing collapse occurs, increase w_m.
-Output:      checkpoints/stage3_best.pt
-```
-
-### Full End-to-End Fine-tuning (Optional)
-```
-Trainable:   All modules
-Loss:        Full L_heatmap + L_cls + L_bbox + L_balance
-Optimizer:   AdamW(lr=2e-6, weight_decay=1e-4)
-Scheduler:   CosineAnnealingLR(T_max=10, eta_min=1e-9)
-Epochs:      10
-Notes:       Very low LR to prevent catastrophic forgetting of stage-learned features.
-Output:      checkpoints/final_best.pt
-```
-
-### Training Logging
-At every epoch, log:
-```
-train_loss, train_heatmap_loss, train_cls_loss, train_bbox_loss, train_balance_loss
-val_loss, val_mAP@50, val_mAP@50:95, val_precision, val_recall, val_f1
-active_expert_fraction (how many experts received >1% tokens this epoch)
-learning_rate
-```
-
----
-
-## 10. Evaluation Protocol
-
-All evaluations use a fixed confidence threshold (tuned on val → deployed on test):
-
-### Detection Metrics
-| Metric | Definition | Significance |
-|---|---|---|
-| **mAP@0.50** | Mean Average Precision at IoU threshold 0.50 | Primary detection metric |
-| **mAP@0.50:0.95** | COCO-style mAP averaged over IoU thresholds 0.50–0.95 | Localization quality |
-| **Precision@τ** | TP / (TP + FP) at confidence τ=0.3 | Spurious detection rate |
-| **Recall@τ** | TP / (TP + FN) at confidence τ=0.3 | Miss rate |
-| **F1@τ** | 2 × P × R / (P + R) at confidence τ=0.3 | Balanced accuracy |
-| **False Positives per Image** | FP count / total frames | Background false alarm rate |
-| **Frame-1 Recall** | Recall on clip-first-frames only | Cold start performance |
-| **Edge Entry Recall** | Recall on frames where target first enters the frame boundary | Boundary detection |
-
-### Tracking Metrics
-| Metric | Definition |
-|---|---|
-| **Success Plot AUC** | Area under target overlap (IoU) success curve from 0 to 1 |
-| **Precision Plot @20px** | % of frames where predicted center is within 20 pixels of GT center |
-| **Occlusion Recovery Rate** | % of occluded targets successfully re-acquired within N=10 frames |
-| **Mean Frames-to-Reacquire** | Mean number of frames to re-detect after occlusion end |
-
-### Efficiency Metrics
-| Metric | Tool |
-|---|---|
-| **GFLOPs per frame** | `fvcore.nn.FlopCountAnalysis` |
-| **FPS (GPU)** | `torch.cuda.Event` timing |
-| **FPS (Edge)** | Measured on Jetson Orin Nano |
-| **Active parameters** | Parameters of top-k activated experts only |
-| **Total parameters** | `sum(p.numel() for p in model.parameters())` |
-| **Peak GPU memory (MB)** | `torch.cuda.max_memory_allocated()` |
-| **Energy per frame (mJ)** | Power × (1/FPS), measured via `tegrastats` on Jetson |
-
-### Robustness Metrics
-| Metric | Protocol |
-|---|---|
-| **mAP vs. target pixel area** | Bin GT boxes by pixel area, compute mAP per bin |
-| **mAP vs. ego-motion speed** | Segment video by camera velocity (from metadata), compute mAP per segment |
-
----
-
-## 11. Ablation Study Design
-
-Each ablation changes exactly ONE component. All other settings are default.
-
-### Ablation 1: LDMI Filter (Core Contribution)
-| Config | LDMI | Expected mAP@50 | Expected Frame-1 Recall |
-|---|---|---|---|
-| Baseline (No LDMI) | Off — raw frame concatenation | Lowest | Low |
-| Single Scale k=15 | Single scale | Medium | Medium |
-| Single Scale k=31 | Single scale | Medium | Medium |
-| **Full (k=15, 31)** | **Multi-scale** | **Highest** | **Highest** |
-
-*Expected finding:* LDMI provides the largest single improvement. Multi-scale outperforms single-scale because it handles both small and medium targets.
-
-### Ablation 2: Crop Sources
-| Config | Sources Active | Expected mAP@50 | Frame-1 Recall |
-|---|---|---|---|
-| Motion Only | Motion peaks only | Medium | Very Low |
-| Edge Only | Edge crops only | Low | High |
-| Grid Only | Grid crops only | Low | Medium |
-| Motion + Grid | No edge | Medium | Medium |
-| Motion + Edge | No grid | Medium | High |
-| **Full (Motion+Edge+Grid+Guided)** | **All** | **Highest** | **Highest** |
-
-*Expected finding:* Each source contributes independently. Edge crops primarily benefit new-target entry recall. Grid crops primarily benefit occlusion recovery. Combined > any single source.
-
-### Ablation 3: Dense vs. Sparse MoE
-| Config | MoE Type | GFLOPs | mAP@50 |
-|---|---|---|---|
-| Dense FFN | Single FFN (no routing) | Highest | ~Same |
-| MoE Top-1 | top_k = 1 | Lowest | Lower |
-| **MoE Top-2** | **top_k = 2** | **Medium** | **~Dense** |
-| MoE Top-4 | top_k = 4 | High | ~Dense |
-
-*Expected finding:* Top-2 MoE matches dense accuracy at significantly lower GFLOPs.
-
-### Ablation 4: Training Stages
-| Config | Training Strategy | mAP@50 |
-|---|---|---|
-| End-to-End (all modules jointly) | Single training run | Lower |
-| Stage 1 Only (no temporal, no MoE) | Only detector | Baseline |
-| Stage 1+2 (detector + temporal) | Two stages | Better |
-| **Stage 1+2+3 (full staged)** | **Three stages** | **Highest** |
-
-*Expected finding:* Staged training outperforms end-to-end because each stage prevents gradient interference between components.
-
-### Hyperparameter Sweep: `num_crops` and `scan_period`
-Run a grid sweep to justify default values:
-
-| `num_crops` | `scan_period` | mAP@50 | Occlusion Recovery | GFLOPs |
-|---|---|---|---|---|
-| 4 | 4 | ? | ? | Lowest |
-| 8 | 2 | ? | ? | Higher |
-| **8** | **4** | **?** | **?** | **Medium** |
-| 8 | 8 | ? | ? | Lower |
-| 8 | 16 | ? | ? | Lowest |
-| 16 | 4 | ? | ? | Highest |
-
-*Selection criterion:* Best mAP@50 × Occlusion Recovery product at lowest GFLOPs.
-
----
-
-## 12. Baseline Comparisons
-
-### Required Baselines (for publication)
-
-| Baseline | Source | Reason |
-|---|---|---|
-| **Anti-UAV v1/v2 Paper baseline** | CVPR Anti-UAV paper | Direct comparison on the benchmark we use |
-| **YOLOv8-S** | Ultralytics | Standard tiny object detection SOTA |
-| **RT-DETR-S** | PaddleDetection | Real-time transformer-based detector |
-| **SORT + YOLOv8** | SORT paper | Classic tracking baseline |
-| **ByteTrack + YOLOv8** | ByteTrack paper | Strong tracking baseline |
-| **DRISHTI-CORE v2 (ours)** | This work | Full proposed method |
-
-For each baseline:
-- Train on the same Anti-UAV train split
-- Evaluate on the same Anti-UAV val split with the same evaluation protocol
-- Report all metrics from Section 10
-
----
-
-## 13. Failure Case Analysis
-
-After the main evaluation run, perform a structured failure analysis:
-
-### Failure Mode 1: Dense Moving Backgrounds (e.g., trees in wind)
-- **Protocol:** Filter test clips where background motion frequency > threshold.
-- **Metric:** mAP@50 on this subset vs. full set.
-- **Expected finding:** LDMI may introduce false positives if tree-leaf motion is locally non-uniform. Document the frequency.
-
-### Failure Mode 2: Target Smaller Than LDMI Scale
-- **Protocol:** Filter clips where GT box area < 25 px².
-- **Metric:** Recall on this subset.
-- **Fix:** Add smaller LDMI scale (k=7) for sub-pixel target detection.
-
-### Failure Mode 3: Long Occlusion (> 15 frames)
-- **Protocol:** Filter clips with occlusions lasting > `max_coast` frames.
-- **Metric:** Track resumption rate on this subset.
-- **Expected finding:** Tracker prunes the track before re-emergence. This is a known limitation.
-
-### Failure Mode 4: Swarm Scenarios (> 4 Simultaneous Targets)
-- **Protocol:** Manually identify multi-target sequences in the Anti-UAV dataset.
-- **Metric:** Multi-target detection rate and track accuracy.
-- **Expected finding:** Crop budget is the bottleneck. With 8 crops and 4+ targets, each target receives ≤1 crop.
-
----
-
-## 14. Compute Budget Plan
-
-| Task | Estimated GPU Hours (A100) | Notes |
-|---|---|---|
-| Stage 1: Detector (80 epochs) | ~12 hours | Single GPU, batch=16 |
-| Stage 2: Temporal (30 epochs) | ~6 hours | Single GPU, batch=8 |
-| Stage 3: MoE (20 epochs) | ~3 hours | Single GPU, batch=8 |
-| E2E Fine-tuning (10 epochs) | ~2 hours | Optional |
-| Baseline: YOLOv8-S | ~4 hours | Standard training |
-| Baseline: RT-DETR-S | ~8 hours | Standard training |
-| Ablation: LDMI (4 configs) | ~4 × 6 = 24 hours | Each = Stage 1 only |
-| Ablation: Crop sources (5 configs) | ~5 × 21 = 105 hours | Full staged training |
-| Ablation: MoE type (3 configs) | ~3 × 5 = 15 hours | Stage 3 only |
-| Ablation: Training stages (4 configs) | ~4 × 21 = 84 hours | Full pipeline per config |
-| Hyperparameter sweep (6 configs) | ~6 × 21 = 126 hours | Full pipeline per config |
-| **Total (estimated)** | **~289 hours** | **~12 A100 days** |
-
-> **Budget Note:** The ablation sweeps dominate. Prioritize: LDMI ablation (24h) + Crop source ablation (105h) as the core contributions. MoE and staging ablations are secondary.
-
----
-
-## 15. Reproducibility Checklist
+Add new loss weight configs:
 
 ```yaml
-Reproducibility:
-  - Set seeds: torch.manual_seed(42), numpy.random.seed(42), random.seed(42)
-  - Enable deterministic: torch.backends.cudnn.deterministic = True
-  - Disable benchmark: torch.backends.cudnn.benchmark = False
-  - Log full config: Dump DRISHTIConfig to YAML at experiment start
-  - Log git hash: Record git commit hash in experiment directory
-  - Save best checkpoint: by val mAP@50, saved every epoch
-  - Save last checkpoint: always, for resuming
-  - Log hardware: GPU model, CUDA version, driver version, RAM
-  - Dataset fingerprint: MD5 hash of train.txt and val.txt file lists
-  - Pin DataLoader workers: num_workers=4, pin_memory=True
+# Stage 1: Spatial Detector losses
+focal_gamma: 2.0
+focal_alpha: 0.25
+heatmap_focal_alpha: 2.0
+heatmap_focal_beta: 4.0
+w_motion_displacement: 0.5
+w_gate_sparsity: 0.01
+
+# Stage 2: Temporal Fusion losses
+w_temporal_consistency: 0.3
+w_trajectory_smoothness: 0.1
+sigma_spatial_consist: 0.1
+
+# Stage 3: MoE losses
+moe_balance_weight: 0.01
+router_z_loss_weight: 0.001
+
+# Motion gating
+use_motion_gate: true
+motion_gate_hidden: 16
+motion_gate_threshold: 0.5
+dense_grid_size: 4
+
+# LDMI scales (updated)
+ldmi_scales: [7, 15, 31, 63]
 ```
+
+---
+
+# Section 4: What Is Learned in Each Stage (and Why)
+
+## Stage 1 — Spatial Detector (80 epochs, lr=1e-4)
+
+**Trainable**: MotionCNN + CropEncoder + DetectionHead + MotionGate
+**Frozen**: CausalTemporalFusion + SparseMoE
+
+### What the model learns
+
+**MotionCNN** receives 15-channel LDMI output and learns to map it to a peaked heatmap.
+
+Mathematically, it learns a function $f_\theta: \mathbb{R}^{15 \times H \times W} \to [0,1]^{H/4 \times W/4}$ such that:
+$$f_\theta(\text{LDMI}(F_{t-2}, F_{t-1}, F_t)) \approx \mathcal{G}_\sigma(\text{gt\_center})$$
+
+The HeatmapFocalLoss guides it to produce sharp peaks at UAV locations ($(1-\hat{y})^\alpha$ penalises flat predictions at peak locations) while the background weight $(1-y)^\beta$ suppresses false positives without aggressively penalising the Gaussian falloff region.
+
+**CropEncoder** learns to produce features that distinguish UAV crops from background crops.
+
+The SigmoidFocalLoss guides it: $\mathcal{L}_{\text{FL}}$ down-weights easy negative crops (the 7/8 that obviously contain no UAV) and forces the model to concentrate on hard cases. Without Focal, the gradient would be dominated by the 7 easy negatives → encoder learns "predict everything as background."
+
+**DetectionHead** learns from CIoU to produce geometrically precise boxes.
+
+The centre-distance term $\rho^2/c^2$ pushes the predicted center toward the GT center even when IoU = 0. At initialisation, random boxes often have zero overlap with GT — Smooth L1 would have large gradient that doesn't account for geometry, but CIoU's center-distance provides a sensible gradient direction regardless.
+
+**MotionGate** learns the 6 heatmap statistics that predict whether the motion signal is trustworthy. The sparsity regulariser $\mathcal{L}_{\text{gate}} = (1 - g)$ prevents it from always outputting low confidence.
+
+**MotionDisplacementLoss** forces the heatmap peak trajectory to match the GT box trajectory:
+
+$$\min_\theta \frac{1}{T-1} \sum_t \|\hat{\mathbf{d}}_t - \mathbf{d}_t\|_2^2$$
+
+This ensures LDMI + MotionCNN captures not just "where is the UAV" but "how is it moving."
+
+---
+
+## Stage 2 — Temporal Fusion (30 epochs, lr=5e-5)
+
+**Trainable**: CausalTemporalFusion
+**Frozen**: MotionCNN + CropEncoder + DetectionHead + MotionGate + SparseMoE
+
+### What the model learns
+
+At this stage, the spatial modules produce stable features (learned in Stage 1). The transformer now sees consistent input and can learn meaningful temporal patterns.
+
+**CausalTemporalFusion** learns to aggregate crop feature histories. Its causal attention over T timesteps:
+
+$$\text{Attn}(Q_t, K_{1:t}, V_{1:t}) = \text{softmax}\left(\frac{Q_t K_{1:t}^T}{\sqrt{d}} + M_{\text{causal}}\right) V_{1:t}$$
+
+The attention weights learn to extract relevant historical context. A crop containing the UAV at time $t$ should attend strongly to its own history at $t-1, t-2$ (where it also contained the UAV) and weakly to times when the crop was a background GRID scan.
+
+**TemporalConsistencyLoss** explicitly penalises score oscillation. A crop that scores 0.9 (positive) at $t=3$ but 0.05 (negative) at $t=4$ then 0.8 (positive) at $t=5$ gets a high penalty. The model learns to propagate confidence across time.
+
+**TrajectorySmoothLoss** penalises acceleration. If the model predicts box at $(0.45, 0.62)$ at $t=3$ and $(0.47, 0.64)$ at $t=4$, velocity = $(+0.02, +0.02)$. If it then predicts $(0.41, 0.61)$ at $t=5$, velocity becomes $(-0.06, -0.03)$, acceleration = $(-0.08, -0.05)$ — very large. The smooth loss penalises this, encouraging the temporal module to produce smooth, physically plausible trajectories.
+
+---
+
+## Stage 3 — MoE Routing (20 epochs, lr=1e-5)
+
+**Trainable**: SparseMoE
+**Frozen**: Everything else
+
+### What the model learns
+
+At this stage, the temporal module produces stable fused features. The MoE learns to route these features to specialized experts.
+
+**SparseMoE router** learns $\mathbf{W}_r \in \mathbb{R}^{8 \times 256}$ such that crops requiring different processing strategies are routed to different experts:
+
+$$p_i = \text{softmax}(\mathbf{W}_r \mathbf{x}_i)$$
+
+With the SigmoidFocalLoss and CIoULoss, expert outputs must be useful for detection. The router is indirectly trained to route in ways that maximise detection accuracy.
+
+**Load-balance loss** ($\mathcal{L}_{\text{balance}} = E \sum_j f_j \bar{p}_j$) prevents routing collapse where all tokens go to 2 experts and the other 6 are never trained.
+
+**Router Z-Loss** prevents the router logits from growing large. Large logits → near-deterministic routing → experts stop receiving diverse training signal → experts don't specialise → the MoE degrades to a single expert.
+
+$$\mathcal{L}_z = \frac{1}{N} \sum_i (\text{logsumexp}(\mathbf{x}_i))^2$$
+
+By penalising large logsumexp values, the router logits stay moderate, probabilities stay spread across multiple experts, and each expert receives enough training signal to develop genuine specialisation.
+
+---
+
+## Stage 4 — End-to-End Finetune (10 epochs, lr=2e-6)
+
+**Trainable**: Everything
+
+### What the model learns
+
+Joint optimisation with a very small learning rate. Each module makes small coordinated adjustments that wouldn't emerge from stage-wise training:
+
+- **MotionCNN** can slightly adjust its heatmap peaks based on feedback from the full downstream pipeline
+- **CropEncoder** can refine features based on what the temporal module and MoE have learned to use
+- **CausalTemporalFusion** can refine temporal patterns based on improved spatial features
+- **SparseMoE** can refine routing based on improved temporal features
+- **DetectionHead** adjusts based on all upstream refinements
+
+The combined Stage4Loss uses all auxiliary terms at reduced weights, ensuring the detection signal ($\mathcal{L}_{\text{Focal}}$, $\mathcal{L}_{\text{CIoU}}$) still dominates.
+
+---
+
+# Section 5: Complete File Change Summary
+
+## All New Files
+
+| File | Purpose |
+|---|---|
+| `drishti_v2/models/motion_gate.py` | Learned heatmap statistics → motion confidence |
+| `drishti_v2/training/focal_loss.py` | Sigmoid Focal Loss + Heatmap Focal Loss |
+| `drishti_v2/training/ciou_loss.py` | Complete IoU Loss |
+| `drishti_v2/training/motion_loss.py` | Motion Displacement Loss |
+| `drishti_v2/training/temporal_loss.py` | Temporal Consistency + Trajectory Smoothness |
+| `drishti_v2/training/stage_losses.py` | Stage1–4 losses + StageLossFactory |
+
+## All Modified Files
+
+| File | Change | Lines |
+|---|---|---|
+| [ldmi.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/ldmi.py) | Full rewrite — 9ch→15ch | All |
+| [motion_cnn.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/motion_cnn.py) | `in_channels` 9→15 | Line 16 |
+| [moe.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/moe.py) | Add `router_z_loss` to diagnostics | Lines 10–26, 68–70 |
+| [crop_proposal.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/crop_proposal.py) | Add `forward_dense()` | After line 64 |
+| [pipeline.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/pipeline.py) | Wire MotionGate, adaptive mode | Lines 37–170 |
+| [config.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/config.py) | New fields, update scales | Lines 18–30 |
+| [stage_control.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/stage_control.py) | MotionGate in stage1 | Line 22 |
+| [losses.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/losses.py) | Add deprecation warning | Lines 14–21 |
+| [trainer.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/training/trainer.py) | Accept `nn.Module`, log new keys | Lines 87, 205, 227, 264–269 |
+| [evaluator.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/evaluation/evaluator.py) | Stage-aware eval | Lines 23–41 |
+| [metrics.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/evaluation/metrics.py) | New metric functions | After line 90 |
+| [\_\_init\_\_.py](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/drishti_v2/models/__init__.py) | Export MotionGate | Lines 3–7 |
+| [default.yaml](file:///c:/Users/jaygo/Desktop/DESKTOP/Research%20Papers/DRISHTI-CORE/configs/default.yaml) | New loss weight fields | Throughout |
+
+## Parameter Count Impact
+
+| Module | Before | After | Delta |
+|---|---|---|---|
+| LDMI | 0 | 0 | 0 |
+| MotionCNN first conv | 9×32×9=2,592 | 15×32×9=4,320 | +1,728 |
+| MotionGate (NEW) | 0 | 129 | +129 |
+| MoE (z_loss is computed, not params) | 1,054,720 | 1,054,720 | 0 |
+| Loss primitives (no params) | — | — | 0 |
+| **Total delta** | — | — | **+1,857** |

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import warnings
+
 import torch
 from torch import Tensor, nn
-import torch.nn.functional as F
 
 from drishti_v2.models.motion_cnn import MotionCNN
 from drishti_v2.models.pipeline import PipelineOutput
+from drishti_v2.training.ciou_loss import ciou_loss
+from drishti_v2.training.focal_loss import heatmap_focal_loss, sigmoid_focal_loss
 
 
 class DRISHTILoss(nn.Module):
@@ -18,6 +21,11 @@ class DRISHTILoss(nn.Module):
         w_bbox: float = 2.0,
         w_balance: float = 0.01,
     ) -> None:
+        warnings.warn(
+            "DRISHTILoss is kept for compatibility. Prefer StageLossFactory.make_loss(stage, config=config).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__()
         self.w_heatmap = w_heatmap
         self.w_cls = w_cls
@@ -65,13 +73,13 @@ class DRISHTILoss(nn.Module):
         last_targets = self._last_targets(targets)
         heatmap_size = heatmap_size or tuple(output.heatmap.shape[-2:])
         gt_heatmap = self._make_heatmaps(last_targets, heatmap_size, output.heatmap.device).to(output.heatmap.dtype)
-        heatmap_loss = F.mse_loss(output.heatmap, gt_heatmap)
+        heatmap_loss = heatmap_focal_loss(output.heatmap, gt_heatmap)
 
         labels, box_targets = self._assign_crops(output, last_targets)
-        cls_loss = F.binary_cross_entropy_with_logits(output.objectness_logits, labels)
+        cls_loss = sigmoid_focal_loss(output.objectness_logits, labels)
         positive = labels.squeeze(-1) > 0.5
         if positive.any():
-            bbox_loss = F.smooth_l1_loss(output.crop_boxes[positive], box_targets[positive])
+            bbox_loss = ciou_loss(output.crop_boxes[positive], box_targets[positive])
         else:
             bbox_loss = output.objectness_logits.sum() * 0.0
         balance = output.balance_loss

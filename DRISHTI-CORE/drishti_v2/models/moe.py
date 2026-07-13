@@ -1,7 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import Tensor, nn
+
+
+@dataclass
+class MoEDiagnostics:
+    balance_loss: Tensor
+    expert_utilization: Tensor
+    routing_probabilities: Tensor
+    router_entropy: Tensor
+    token_drop_rate: Tensor
+    expert_reuse_frequency: Tensor
+    load_balance_cv: Tensor
+    expert_overlap: Tensor
+    router_z_loss: Tensor
 
 
 class Expert(nn.Module):
@@ -41,16 +56,45 @@ class SparseMoE(nn.Module):
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList([Expert(d_model, ffn_dim, dropout) for _ in range(num_experts)])
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def _diagnostics(self, probs: Tensor, dispatch: Tensor, balance_loss: Tensor, z_loss: Tensor) -> MoEDiagnostics:
+        utilization = dispatch.mean(dim=0)
+        mean_prob = probs.mean(dim=0)
+        entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1).mean()
+        load_cv = utilization.std(unbiased=False) / utilization.mean().clamp_min(1e-8)
+        token_drop_rate = probs.new_tensor(0.0)
+        assigned = dispatch > 0
+        overlaps = []
+        for left in range(self.num_experts):
+            for right in range(left + 1, self.num_experts):
+                intersection = (assigned[:, left] & assigned[:, right]).to(probs.dtype).sum()
+                union = (assigned[:, left] | assigned[:, right]).to(probs.dtype).sum().clamp_min(1.0)
+                overlaps.append(intersection / union)
+        expert_overlap = torch.stack(overlaps).mean() if overlaps else probs.new_tensor(0.0)
+        return MoEDiagnostics(
+            balance_loss=balance_loss,
+            expert_utilization=utilization.detach(),
+            routing_probabilities=probs.detach(),
+            router_entropy=entropy.detach(),
+            token_drop_rate=token_drop_rate,
+            expert_reuse_frequency=mean_prob.detach(),
+            load_balance_cv=load_cv.detach(),
+            expert_overlap=expert_overlap.detach(),
+            router_z_loss=z_loss,
+        )
+
+    def forward(self, x: Tensor) -> tuple[Tensor, MoEDiagnostics]:
         *leading, dim = x.shape
         x_flat = x.reshape(-1, dim)
-        probs = torch.softmax(self.router(x_flat), dim=-1)
+        router_logits = self.router(x_flat)
+        z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+        probs = torch.softmax(router_logits, dim=-1)
 
         if self.dense:
             expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)
             out = (expert_outputs * probs.unsqueeze(-1)).sum(dim=1)
             balance_loss = probs.new_tensor(0.0)
-            return out.reshape(*leading, dim), balance_loss
+            diagnostics = self._diagnostics(probs, probs, balance_loss, z_loss)
+            return out.reshape(*leading, dim), diagnostics
 
         top_probs, top_indices = probs.topk(self.top_k, dim=-1)
         top_weights = top_probs / top_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -69,4 +113,5 @@ class SparseMoE(nn.Module):
         fraction = dispatch.mean(dim=0) / float(self.top_k)
         probability = probs.mean(dim=0)
         balance_loss = self.num_experts * torch.sum(fraction * probability)
-        return out.reshape(*leading, dim), balance_loss
+        diagnostics = self._diagnostics(probs, dispatch / float(self.top_k), balance_loss, z_loss)
+        return out.reshape(*leading, dim), diagnostics

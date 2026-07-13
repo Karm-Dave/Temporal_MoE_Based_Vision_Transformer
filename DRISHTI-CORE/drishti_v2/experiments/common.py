@@ -39,11 +39,18 @@ def build_loader(
     synthetic: bool = False,
     shuffle: bool = False,
     frames_root: str | None = None,
-    modality: str = "visible",
-    clip_stride: int = 4,
-    frame_stride: int = 1,
-    box_format: str = "xywh",
+    modality: str | None = None,
+    clip_stride: int | None = None,
+    frame_stride: int | None = None,
+    box_format: str | None = None,
 ) -> DataLoader:
+    data_root = data_root or config.data_root
+    frames_root = frames_root or config.frames_root
+    modality = modality or config.modality
+    clip_stride = config.clip_stride if clip_stride is None else clip_stride
+    frame_stride = config.frame_stride if frame_stride is None else frame_stride
+    box_format = box_format or config.box_format
+
     if frames_root:
         dataset = AntiUAVExtractedFrameDataset(
             frames_root=frames_root,
@@ -98,10 +105,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--frames-root", default=None)
     parser.add_argument("--data-root", default=None)
-    parser.add_argument("--modality", default="visible", choices=["visible", "infrared"])
-    parser.add_argument("--clip-stride", type=int, default=4)
-    parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--box-format", default="xywh", choices=["xywh", "xyxy"])
+    parser.add_argument("--modality", default=None, choices=["visible", "infrared"])
+    parser.add_argument("--clip-stride", type=int, default=None)
+    parser.add_argument("--frame-stride", type=int, default=None)
+    parser.add_argument("--box-format", default=None, choices=["xywh", "xyxy"])
     parser.add_argument("--device", default=None)
     parser.add_argument("--synthetic", action="store_true", help="Use generated data for smoke runs.")
 

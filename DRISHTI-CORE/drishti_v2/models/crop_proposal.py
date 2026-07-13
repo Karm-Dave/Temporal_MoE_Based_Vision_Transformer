@@ -31,13 +31,20 @@ class CropProposalEngine(nn.Module):
         super().__init__()
         self.config = config
         grid = torch.tensor(
-            [(0.30, 0.30), (0.30, 0.70), (0.70, 0.30), (0.70, 0.70)],
+            [(1 / 3, 1 / 3), (1 / 3, 2 / 3), (2 / 3, 1 / 3), (2 / 3, 2 / 3)],
             dtype=torch.float32,
         )
+        dense_points = [
+            ((col + 1) / (config.dense_grid_size + 1), (row + 1) / (config.dense_grid_size + 1))
+            for row in range(config.dense_grid_size)
+            for col in range(config.dense_grid_size)
+        ]
+        dense_grid = torch.tensor(dense_points, dtype=torch.float32)
         bw = config.border_width_frac
         edge_horizontal = torch.tensor([(bw / 2.0, 0.5), (1.0 - bw / 2.0, 0.5)], dtype=torch.float32)
         edge_vertical = torch.tensor([(0.5, bw / 2.0), (0.5, 1.0 - bw / 2.0)], dtype=torch.float32)
         self.register_buffer("interior_grid", grid, persistent=False)
+        self.register_buffer("dense_grid", dense_grid, persistent=False)
         self.register_buffer("edge_horizontal", edge_horizontal, persistent=False)
         self.register_buffer("edge_vertical", edge_vertical, persistent=False)
 
@@ -73,18 +80,20 @@ class CropProposalEngine(nn.Module):
         batch, channels, height, width = frame.shape
         num_crops = centers.shape[1]
         crop_size = self.config.crop_size
-        half = crop_size / 2.0
-        crops: list[Tensor] = []
-        padded = F.pad(frame, (crop_size, crop_size, crop_size, crop_size), mode="replicate")
+        dtype = frame.dtype
+        device = frame.device
 
-        px = centers[..., 0].clamp(0, 1) * (width - 1) + crop_size
-        py = centers[..., 1].clamp(0, 1) * (height - 1) + crop_size
-        for b_idx in range(batch):
-            for k_idx in range(num_crops):
-                x0 = int(round(float(px[b_idx, k_idx] - half)))
-                y0 = int(round(float(py[b_idx, k_idx] - half)))
-                crops.append(padded[b_idx, :, y0 : y0 + crop_size, x0 : x0 + crop_size])
-        return torch.stack(crops, dim=0).reshape(batch * num_crops, channels, crop_size, crop_size)
+        offsets = torch.arange(crop_size, device=device, dtype=dtype) - (crop_size - 1) / 2.0
+        x_offsets = 2.0 * offsets / max(width - 1, 1)
+        y_offsets = 2.0 * offsets / max(height - 1, 1)
+        grid_y, grid_x = torch.meshgrid(y_offsets, x_offsets, indexing="ij")
+        offset_grid = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, crop_size, crop_size, 2)
+
+        base = centers.clamp(0, 1).mul(2.0).sub(1.0).view(batch, num_crops, 1, 1, 2)
+        grid = (base + offset_grid).reshape(batch * num_crops, crop_size, crop_size, 2)
+        expanded = frame[:, None].expand(batch, num_crops, channels, height, width)
+        expanded = expanded.reshape(batch * num_crops, channels, height, width)
+        return F.grid_sample(expanded, grid, mode="bilinear", padding_mode="border", align_corners=True)
 
     def _append(
         self,
@@ -100,13 +109,25 @@ class CropProposalEngine(nn.Module):
             sources.extend([source_label] * slots)
         return slots
 
+    def _make_output(self, frame: Tensor, heatmap: Tensor, centers: Tensor, sources: list[int]) -> ProposalOutput:
+        total = centers.shape[1]
+        source_labels = torch.tensor(sources[:total], device=frame.device, dtype=torch.long)
+        source_labels = source_labels.view(1, total).expand(frame.shape[0], -1)
+        scores = self._scores_at_centers(heatmap, centers)
+        crops = self._extract_crops(frame, centers)
+        return ProposalOutput(crops=crops, centers=centers, scores=scores, source_labels=source_labels, heatmap=heatmap)
+
     def forward(
         self,
         frame: Tensor,
         heatmap: Tensor,
         frame_index: int,
         guided_centers: Tensor | None = None,
+        dense: bool = False,
     ) -> ProposalOutput:
+        if dense:
+            return self.forward_dense(frame, heatmap, guided_centers)
+
         batch = frame.shape[0]
         total = self.config.num_crops
         device = frame.device
@@ -155,7 +176,37 @@ class CropProposalEngine(nn.Module):
             sources.extend([self.PAD] * remaining)
 
         centers = torch.cat(centers_list, dim=1)[:, :total].contiguous()
-        sources_tensor = torch.tensor(sources[:total], device=device, dtype=torch.long).view(1, total).expand(batch, -1)
-        scores = self._scores_at_centers(heatmap, centers)
-        crops = self._extract_crops(frame, centers)
-        return ProposalOutput(crops=crops, centers=centers, scores=scores, source_labels=sources_tensor, heatmap=heatmap)
+        return self._make_output(frame, heatmap, centers, sources)
+
+    def forward_dense(
+        self,
+        frame: Tensor,
+        heatmap: Tensor,
+        guided_centers: Tensor | None = None,
+    ) -> ProposalOutput:
+        batch = frame.shape[0]
+        total = self.config.dense_num_crops
+        device = frame.device
+        centers_list: list[Tensor] = []
+        sources: list[int] = []
+        remaining = total
+
+        if guided_centers is not None and self.config.use_guided_crops:
+            guided = guided_centers.to(device).clamp(0.0, 1.0)
+            if guided.shape[0] == 1 and batch > 1:
+                guided = guided.expand(batch, -1, -1)
+            used = self._append(centers_list, sources, guided, self.GUIDED, remaining)
+            remaining -= used
+
+        if remaining > 0:
+            grid = self.dense_grid.to(device).unsqueeze(0).expand(batch, -1, -1)
+            used = self._append(centers_list, sources, grid, self.GRID, remaining)
+            remaining -= used
+
+        if remaining > 0:
+            pad = frame.new_tensor((0.5, 0.5)).view(1, 1, 2).expand(batch, remaining, 2)
+            centers_list.append(pad)
+            sources.extend([self.PAD] * remaining)
+
+        centers = torch.cat(centers_list, dim=1)[:, :total].contiguous()
+        return self._make_output(frame, heatmap, centers, sources)
